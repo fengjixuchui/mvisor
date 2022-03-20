@@ -22,7 +22,7 @@
 #include <cstdint>
 #include "ide_storage.h"
 #include "device.h"
-
+#include "states/ahci_host.pb.h"
 
 struct AhciCommandHeader {
   uint8_t     command_fis_length : 5; // in DWORDS, 2 ~ 16
@@ -89,6 +89,11 @@ class AhciPort {
   void Write(uint64_t offset, uint32_t value);
   void Read(uint64_t offset, uint32_t* data);
   void Reset();
+  void SoftReset();
+
+  /* Called by AhciHost */
+  void SaveState(AhciHostState_PortState* port_state);
+  void LoadState(const AhciHostState_PortState* port_state);
 
  private:
   void TrigerIrq(int irqbit);
@@ -109,6 +114,7 @@ class AhciPort {
   bool                  init_d2h_sent_ = false;
   uint8_t*              command_list_ = nullptr;
   AhciRxFis*            rx_fis_ = nullptr;
+  int                   busy_slot_ = -1;
 };
 
 #endif // __MVISOR_DEVICES_AHCI_PORT_H

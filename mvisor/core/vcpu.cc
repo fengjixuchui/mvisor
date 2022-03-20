@@ -22,14 +22,18 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <cstring>
+
 #include "machine.h"
 #include "logger.h"
+#include "states/vcpu.pb.h"
 
-#define MAX_KVM_CPUID_ENTRIES 100
+#define MAX_KVM_CPUID_ENTRIES         100
+#define CPUID_TOPOLOGY_LEVEL_SMT      (1U << 8)
+#define CPUID_TOPOLOGY_LEVEL_CORE     (2U << 8)
+#define CPUID_TOPOLOGY_LEVEL_INVALID  (0U << 8)
 
 /* Use Vcpu::current_vcpu() */
 __thread Vcpu* Vcpu::current_vcpu_ = nullptr;
-
 
 Vcpu::Vcpu(Machine* machine, int vcpu_id)
     : machine_(machine), vcpu_id_(vcpu_id) {
@@ -45,7 +49,8 @@ Vcpu::Vcpu(Machine* machine, int vcpu_id)
   /* Handle multiple MMIO operations at one time */
   int coalesced_offset = ioctl(machine_->kvm_fd_, KVM_CHECK_EXTENSION, KVM_CAP_COALESCED_MMIO);
   if (coalesced_offset) {
-    mmio_ring_ = (struct kvm_coalesced_mmio_ring*)((uint64_t)kvm_run_ + coalesced_offset * PAGE_SIZE);
+    auto ring = (kvm_coalesced_mmio_ring*)((uint64_t)kvm_run_ + coalesced_offset * PAGE_SIZE);
+    machine_->device_manager()->SetupCoalescingMmioRing(ring);
   }
 
   /* Save default registers for system reset */
@@ -60,7 +65,7 @@ Vcpu::~Vcpu() {
     thread_.join();
   }
   if (fd_ > 0)
-    close(fd_);
+    safe_close(&fd_);
   if (kvm_run_)
     munmap(kvm_run_, machine_->kvm_vcpu_mmap_size_);
 }
@@ -98,7 +103,11 @@ void Vcpu::SetupCpuid() {
     switch (entry->function)
     {
     case 0x1: // ACPI ID & Features
-      entry->ecx &= ~(1 << 31); // disable hypervisor mode now
+      if (machine_->hypervisor_) {
+        entry->ecx |= (1 << 31);
+      } else {
+        entry->ecx &= ~(1 << 31); // disable hypervisor mode now
+      }
       entry->ebx = (vcpu_id_ << 24) | (machine_->num_vcpus_ << 16) | (entry->ebx & 0xFFFF);
       machine_->cpuid_version_ = entry->eax;
       machine_->cpuid_features_ = entry->edx;
@@ -106,30 +115,45 @@ void Vcpu::SetupCpuid() {
     case 0x6: // Thermal and Power Management Leaf
       entry->ecx = entry->ecx & ~(1 << 3); // disable peformance energy bias
       break;
+		case 0xA: { // Architectural Performance Monitoring
+			union cpuid10_eax {
+				struct {
+					unsigned int version_id		:8;
+					unsigned int num_counters	:8;
+					unsigned int bit_width		:8;
+					unsigned int mask_length	:8;
+				} split;
+				unsigned int full;
+			} eax;
+
+			/* If the host has perf system running, but no architectural events available
+			 * through kvm pmu -- disable perf support, thus Linux won't even try to access msr
+			 * registers. */
+			if (entry->eax) {
+				eax.full = entry->eax;
+				if (eax.split.version_id != 2 || !eax.split.num_counters)
+					entry->eax = 0;
+			}
+			break;
+		}
     case 0xB: // CPU topology (cores = num_vcpus / 2, threads per core = 2)
-      if (machine_->num_vcpus_ % 2 == 0) {
-        switch (entry->index)
-        {
-        case 0:
-          entry->ebx = machine_->num_vcpus_;
-          break;
-        default:
-          entry->ebx = 0;
-          break;
-        }
-      } else {
-        switch (entry->index)
-        {
-        case 0:
+      switch (entry->index) {
+      case 0:
+          entry->eax = 1;
           entry->ebx = 2;
+          entry->ecx |= CPUID_TOPOLOGY_LEVEL_SMT;
           break;
-        case 1:
-          entry->ebx = machine_->num_vcpus_ / 2;
-        default:
+      case 1:
+          entry->eax = 2;
+          entry->ebx = machine_->num_vcpus_ * 2;
+          entry->ecx |= CPUID_TOPOLOGY_LEVEL_CORE;
+          break;
+      default:
+          entry->eax = 0;
           entry->ebx = 0;
-          break;
-        }
+          entry->ecx |= CPUID_TOPOLOGY_LEVEL_INVALID;
       }
+      entry->ecx = entry->index & 0xFF;
       entry->edx = vcpu_id_;
       break;
     case 0x80000002 ... 0x80000004: { // Setup CPU model string
@@ -162,25 +186,21 @@ void Vcpu::EnableSingleStep() {
 
 /* Memory trapped IO */
 void Vcpu::ProcessMmio() {
-  if (mmio_ring_) {
-    const int max_entries = ((PAGE_SIZE - sizeof(struct kvm_coalesced_mmio_ring)) / \
-      sizeof(struct kvm_coalesced_mmio));
-    while (mmio_ring_->first != mmio_ring_->last) {
-      struct kvm_coalesced_mmio *m = &mmio_ring_->coalesced_mmio[mmio_ring_->first];
-      machine_->device_manager()->HandleMmio(m->phys_addr, m->data, m->len, 1);
-      mmio_ring_->first = (mmio_ring_->first + 1) % max_entries;
-    }
-  }
+  auto dm = machine_->device_manager();
+  dm->FlushCoalescingMmioBuffer();
 
   auto *mmio = &kvm_run_->mmio;
-  machine_->device_manager()->HandleMmio(mmio->phys_addr, mmio->data, mmio->len, mmio->is_write);
+  dm->HandleMmio(mmio->phys_addr, mmio->data, mmio->len, mmio->is_write);
 }
 
 /* Traditional IN, OUT operations */
 void Vcpu::ProcessIo() {
+  auto dm = machine_->device_manager();
+  dm->FlushCoalescingMmioBuffer();
+
   auto *io = &kvm_run_->io;
   uint8_t* data = reinterpret_cast<uint8_t*>(kvm_run_) + kvm_run_->io.data_offset;
-  machine_->device_manager()->HandleIo(io->port, data, io->size, io->direction, io->count);
+  dm->HandleIo(io->port, data, io->size, io->direction, io->count);
 }
 
 /* To wake up a vcpu thread, the easist way is to send a signal */
@@ -200,14 +220,20 @@ void Vcpu::SetupSingalHandler() {
 /* Initialize and executing a vCPU thread */
 void Vcpu::Process() {
   current_vcpu_ = this;
-  sprintf(name_, "vcpu-%d", vcpu_id_);
+  sprintf(name_, "mvisor-vcpu-%d", vcpu_id_);
   
   SetThreadName(name_);
   SetupSingalHandler();
 
   if (machine_->debug()) MV_LOG("%s started", name_);
 
-  for (; machine_->valid_;) {
+  while (true) {
+    while (machine_->IsPaused()) {
+      machine_->WaitToResume();
+    }
+    if (!machine_->IsValid()) {
+      break;
+    }
     int ret = ioctl(fd_, KVM_RUN, 0);
     if (ret < 0 && errno != EINTR) {
       if (errno == EAGAIN) {
@@ -289,4 +315,125 @@ void Vcpu::PrintRegisters() {
 
   // call logger.h
   ::PrintRegisters(regs, sregs);
+}
+
+
+bool Vcpu::SaveState(MigrationWriter* writer) {
+  std::stringstream prefix;
+  prefix << "vcpu-" << vcpu_id_;
+  writer->SetPrefix(prefix.str());
+
+  VcpuState state;
+
+  /* KVM vcpu events */
+  kvm_vcpu_events events;
+  MV_ASSERT(ioctl(fd_, KVM_GET_VCPU_EVENTS, &events) == 0);
+  state.set_events(&events, sizeof(events));
+
+  /* KVM MP State */
+  kvm_mp_state mp_state;
+  MV_ASSERT(ioctl(fd_, KVM_GET_MP_STATE, &mp_state) == 0);
+  state.set_mp_state(mp_state.mp_state);
+
+  /* Common regsiters */
+  kvm_regs regs;
+  MV_ASSERT(ioctl(fd_, KVM_GET_REGS, &regs) == 0);
+  state.set_regs(&regs, sizeof(regs));
+
+  /* XSAVE */
+  kvm_xsave xsave;
+  MV_ASSERT(ioctl(fd_, KVM_GET_XSAVE, &xsave) == 0);
+  state.set_xsave(&xsave, sizeof(xsave));
+
+  /* XCRS */
+  kvm_xcrs xcrs;
+  MV_ASSERT(ioctl(fd_, KVM_GET_XCRS, &xcrs) == 0);
+  state.set_xcrs(&xcrs, sizeof(xcrs));
+
+  /* Special registers */
+  kvm_sregs sregs;
+  MV_ASSERT(ioctl(fd_, KVM_GET_SREGS, &sregs) == 0);
+  state.set_sregs(&sregs, sizeof(sregs));
+
+  /* MSRS Indices */
+  struct {
+    kvm_msr_list  list;
+    uint32_t      indices[100];
+  } msr_list = { .list = { sizeof(msr_list.indices) / sizeof(uint32_t) } };
+  MV_ASSERT(ioctl(machine_->kvm_fd_, KVM_GET_MSR_INDEX_LIST, &msr_list) == 0);
+
+  /* MSRS */
+  struct {
+    kvm_msrs      msrs;
+    kvm_msr_entry entries[100];
+  } msrs = { .msrs = { .nmsrs = msr_list.list.nmsrs } };
+  for (uint i = 0; i < msr_list.list.nmsrs; i++) {
+    msrs.entries[i].index = msr_list.indices[i];
+  }
+  MV_ASSERT(ioctl(fd_, KVM_GET_MSRS, &msrs) == (int)msrs.msrs.nmsrs);
+  state.set_msrs(&msrs, sizeof(msrs));
+
+  /* LAPIC */
+  kvm_lapic_state lapic;
+  MV_ASSERT(ioctl(fd_, KVM_GET_LAPIC, &lapic) == 0);
+  state.set_lapic(&lapic, sizeof(lapic));
+
+  writer->WriteProtobuf("CPU", state);
+  return true;
+}
+
+bool Vcpu::LoadState(MigrationReader* reader) {
+  std::stringstream prefix;
+  prefix << "vcpu-" << vcpu_id_;
+  reader->SetPrefix(prefix.str());
+
+  VcpuState state;
+  if (!reader->ReadProtobuf("CPU", state)) {
+    return false;
+  }
+
+  /* Special registers */
+  kvm_sregs sregs;
+  memcpy(&sregs, state.sregs().data(), sizeof(sregs));
+  MV_ASSERT(ioctl(fd_, KVM_SET_SREGS, &sregs) == 0);
+
+  /* Common regsiters */
+  kvm_regs regs;
+  memcpy(&regs, state.regs().data(), sizeof(regs));
+  MV_ASSERT(ioctl(fd_, KVM_SET_REGS, &regs) == 0);
+
+  /* XSAVE */
+  kvm_xsave xsave;
+  memcpy(&xsave, state.xsave().data(), sizeof(xsave));
+  MV_ASSERT(ioctl(fd_, KVM_SET_XSAVE, &xsave) == 0);
+
+  /* XCRS */
+  kvm_xcrs xcrs;
+  memcpy(&xcrs, state.xcrs().data(), sizeof(xcrs));
+  MV_ASSERT(ioctl(fd_, KVM_SET_XCRS, &xcrs) == 0);
+
+  /* MSRS */
+  struct {
+    kvm_msrs      msrs;
+    kvm_msr_entry entries[100];
+  } msrs;
+  memcpy(&msrs, state.msrs().data(), sizeof(msrs));
+  MV_ASSERT(ioctl(fd_, KVM_SET_MSRS, &msrs) == (int)msrs.msrs.nmsrs);
+
+  /* KVM vcpu events */
+  kvm_vcpu_events events;
+  memcpy(&events, state.events().data(), sizeof(events));
+  MV_ASSERT(ioctl(fd_, KVM_SET_VCPU_EVENTS, &events) == 0);
+  
+  /* KVM MP State */
+  kvm_mp_state mp_state;
+  mp_state.mp_state = state.mp_state();
+  MV_ASSERT(ioctl(fd_, KVM_SET_MP_STATE, &mp_state) == 0);
+
+  /* LAPIC */
+  kvm_lapic_state lapic;
+  memcpy(&lapic, state.lapic().data(), sizeof(lapic));
+  MV_ASSERT(ioctl(fd_, KVM_SET_LAPIC, &lapic) == 0);
+
+  return true;
 }

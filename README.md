@@ -5,7 +5,7 @@
 1. A minimal hypervisor based on KVM and x86 (replace QEMU)
 2. A limited number of emulated devices (support plugins in later version)
 3. Linux and Windows as guest VMs
-4. VFIO (espectially vGPU) and migration
+4. VFIO (especially vGPU) and migration
 5. Extremely stable and high performance
 
 
@@ -36,41 +36,44 @@ Nov 2021
 Milestone 2: Multimedia & Networking
 Feb 2022
 
-1. VirtIO (Console ✅ / Block ✅ / Net ✅ / Balloon)
+1. Virtio (Console ✅ / Block ✅ / Net ✅ / Balloon)
 2. SpiceAgent ✅
 3. QemuGuestAgent
 4. Qxl ✅
-5. Audio (ICH9-HDA)
+5. Audio (ICH9-HDA) ✅
 6. Tap network
 7. User network ✅
 8. SfAgent
-9. VFIO
-10. WebDAV
+9. VFIO ✅
+10. Samba
+11. XHCI ✅ / USB Tablet ✅
 
 Milestone 3: Migration
 Mar 2022
-...
+1. CPU migration ✅
+2. VFIO migration ✅
+3. Migration to compressed file
 
 Milestone 4: Virtualization Management
 Apr 2022
-...
+1. Monitor unix socket
 
 ## Install
 
 For CentOS 8,
 
 ```
-yum install -y libaio-devel SDL2-devel yaml-cpp-devel gcc-c++
-make -j 8
+yum install -y gcc-c++ SDL2-devel yaml-cpp-devel libuuid-devel protobuf-devel protobuf-compiler libzstd-devel
+make -j8
 ```
 
 An ISO image file is needed to install OS. Modify config/default.yaml to configure image path.
 
-Guest tools:
+Virtio is recommended:
 
-<a href="https://www.spice-space.org/download/windows/spice-guest-tools/spice-guest-tools-latest.exe">Downlaod spice guest tools</a>
+<a href="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso">Downlaod Virtio Guest Tools</a>
 
 ## Screenshot
 
-<img src="./docs/win10.jpg" width="640">
+<img src="./docs/multimedia.jpg" width="640">
 

@@ -21,6 +21,9 @@
 
 #include <linux/pci_regs.h>
 #include "device.h"
+#include "logger.h"
+
+#define _MB(x) (x * (1 << 20))
 
 /*
  * PCI Configuration Mechanism #1 I/O ports. See Section 3.7.4.1.
@@ -94,6 +97,8 @@ struct PciMsiConfig {
   /* MSI-X BAR */
   uint8_t        msix_bar;
   uint16_t       msix_table_size;
+  uint64_t       msix_space_offset;
+  uint64_t       msix_space_size;
   MsiXTableEntry msix_table[PCI_MAX_MSIX_ENTRIES];
 };
 
@@ -120,6 +125,7 @@ union PciConfigAddress {
 #define PCI_DEVICE_CONFIG_SIZE 256
 #define PCI_DEVICE_CONFIG_MASK (PCI_DEVICE_CONFIG_SIZE - 1)
 #define PCI_BAR_NUMS 6
+#define PCIE_DEVICE_CONFIG_SIZE 0x1000
 
 #define Q35_MASK(bit, ms_bit, ls_bit) \
 ((uint##bit##_t)(((1ULL << ((ms_bit) + 1)) - 1) & ~((1ULL << ls_bit) - 1)))
@@ -152,11 +158,10 @@ struct PciConfigHeader {
       uint8_t    max_lat;
     } __attribute__((packed));
     /* Pad to PCI config space size */
-    uint8_t data[PCI_DEVICE_CONFIG_SIZE];
+    uint8_t data[PCIE_DEVICE_CONFIG_SIZE];
   };
 };
 
-class MemoryRegion;
 struct PciBarInfo {
   IoResourceType        type;
   uint32_t              size;
@@ -165,7 +170,6 @@ struct PciBarInfo {
   uint32_t              special_bits;
   bool                  active;
   void*                 host_memory;
-  const MemoryRegion*   mapped_region;
 };
 
 struct PciRomBarInfo {
@@ -178,7 +182,8 @@ struct PciRomBarInfo {
  * Undefined for ranges that wrap around 0. */
 static inline uint64_t range_get_last(uint64_t offset, uint64_t len)
 {
-    return offset + len - 1;
+  MV_ASSERT(len > 0);
+  return offset + len - 1;
 }
 
 /* Check whether 2 given ranges overlap.
@@ -198,22 +203,28 @@ class PciDevice : public Device {
   virtual ~PciDevice();
   virtual void Disconnect();
 
-  uint8_t bus() { return 0; }
+  uint8_t bus() { return bus_; }
   uint8_t devfn() { return devfn_; }
   const PciConfigHeader& pci_header() { return pci_header_; }
+  const PciBarInfo& pci_bar(uint8_t index) { return pci_bars_[index]; }
+  uint    pci_config_size() { return is_pcie_ ? PCIE_DEVICE_CONFIG_SIZE : PCI_DEVICE_CONFIG_SIZE; }
 
   virtual void ReadPciConfigSpace(uint64_t offset, uint8_t* data, uint32_t length);
   virtual void WritePciConfigSpace(uint64_t offset, uint8_t* data, uint32_t length);
-  virtual void Read(const IoResource& ir, uint64_t offset, uint8_t* data, uint32_t size);
-  virtual void Write(const IoResource& ir, uint64_t offset, uint8_t* data, uint32_t size);
+  virtual void Read(const IoResource* resource, uint64_t offset, uint8_t* data, uint32_t size);
+  virtual void Write(const IoResource* resource, uint64_t offset, uint8_t* data, uint32_t size);
   void WritePciCommand(uint16_t command);
   void WritePciBar(uint8_t index, uint32_t value);
 
- protected:
-  friend class DeviceManager;
-  // PCI devices may override these members to handle bar regsiter events
+  /* PCI devices may override these members to handle bar regsiter events */
   virtual bool ActivatePciBar(uint8_t index);
   virtual bool DeactivatePciBar(uint8_t index);
+
+  /* PCI Migration */
+  virtual bool SaveState(MigrationWriter* writer);
+  virtual bool LoadState(MigrationReader* reader);
+ protected:
+  friend class DeviceManager;
 
   bool ActivatePciBarsWithinRegion(uint32_t base, uint32_t size);
   bool DeactivatePciBarsWithinRegion(uint32_t base, uint32_t size);
@@ -222,15 +233,17 @@ class PciDevice : public Device {
   void AddPciBar(uint8_t index, uint32_t size, IoResourceType type);
   uint8_t* AddCapability(uint8_t cap, const uint8_t* data, uint8_t length);
   void AddMsiCapability();
-  void AddMsiXCapability(uint8_t bar, uint16_t table_size);
+  void AddMsiXCapability(uint8_t bar, uint16_t table_size, uint64_t space_offset, uint64_t space_size);
   void SignalMsi(int vector = 0);
 
-  uint8_t devfn_;
-  PciConfigHeader pci_header_;
-  PciBarInfo pci_bars_[PCI_BAR_NUMS];
-  PciRomBarInfo pci_rom_;
-  PciMsiConfig msi_config_;
-  uint16_t next_capability_offset_;
+  uint8_t           devfn_;
+  uint8_t           bus_;
+  PciConfigHeader   pci_header_;
+  PciBarInfo        pci_bars_[PCI_BAR_NUMS];
+  PciRomBarInfo     pci_rom_;
+  PciMsiConfig      msi_config_;
+  uint16_t          next_capability_offset_;
+  bool              is_pcie_;
 };
 
 #endif // _MVISOR_PCI_DEVICE_H

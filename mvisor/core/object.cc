@@ -35,10 +35,6 @@ void Object::set_classname(const char* classname) {
   strncpy(classname_, classname, OBJECT_MAX_NAME_LENGTH - 1);
 }
 
-void Object::set_debug(bool debug) {
-  debug_ = debug;
-}
-
 Object::Object() {
 
 }
@@ -51,5 +47,13 @@ void Object::AddChild(Object* object) {
   object->parent_ = this;
   if (std::find(children_.begin(), children_.end(), object) == children_.end()) {
     children_.push_back(object);
+  }
+}
+
+void Object::RemoveChild(Object* object) {
+  object->parent_ = nullptr;
+  auto it = std::find(children_.begin(), children_.end(), object);
+  if (it != children_.end()) {
+    children_.erase(it);
   }
 }

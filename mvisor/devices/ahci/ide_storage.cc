@@ -77,28 +77,47 @@ void IdeStorageDevice::Connect() {
   }
   if (has_key("image")) {
     std::string path = std::get<std::string>(key_values_["image"]);
-    image_ = DiskImage::Create(path, readonly);
+    image_ = DiskImage::Create(this, path, readonly);
   }
 }
 
+/* Windows checks CD-Rom status every second. It wastes CPU cycles.
+ * We return false if image is not inserted but OS cannot detect the device at all.
+ * Maybe we should support IDE hotplug?
+ */
 bool IdeStorageDevice::IsAvailable() {
-   if (type_ == kIdeStorageTypeCdrom) {
-     return true;
-   } else {
-     return image_ != nullptr;
-   }
+  return image_ != nullptr;
 }
 
-void IdeStorageDevice::StartCommand() {
+void IdeStorageDevice::CompleteCommand() {
+  regs_.status &= ~ATA_SR_BSY;
+  io_complete_();
+}
+
+void IdeStorageDevice::StartCommand(VoidCallback iocp) {
   MV_ASSERT(IsAvailable());
-  regs_.status = ATA_SR_DRDY;
+
   regs_.error = 0;
   io_.dma_status = 0;
   io_.nbytes = 0;
+  
+  if (regs_.status & (ATA_SR_BSY)) {
+    if (regs_.command != ATA_CMD_DEVICE_RESET || type_ != kIdeStorageTypeCdrom) {
+      MV_PANIC("invalid command 0x%x while busy", regs_.command);
+      return;
+    }
+  }
+
+  io_complete_ = iocp;
+  io_async_ = false;
+  regs_.status = ATA_SR_DRDY | ATA_SR_BSY;
 
   auto handler = ata_handlers_[regs_.command];
   if (handler) {
     handler();
+    if (!io_async_) {
+      CompleteCommand();
+    }
   } else {
     MV_PANIC("unknown command 0x%x", regs_.command);
   }

@@ -23,6 +23,7 @@
 #include "memory_manager.h"
 #include "machine.h"
 #include "smbios.h"
+#include "states/firmware_config.pb.h"
 
 #define FW_CFG_ACPI_DEVICE_ID "QEMU0002"
 
@@ -114,14 +115,21 @@ class FirmwareConfig : public Device {
     SetConfigUInt32(FW_CFG_ID, version);
     SetConfigUInt32(FW_CFG_FILE_DIR, 0);
 
-    int num_vcpus = manager_->machine()->num_vcpus();
+    auto machine = manager_->machine();
+    int num_vcpus = machine->num_vcpus();
     SetConfigUInt16(FW_CFG_NB_CPUS, num_vcpus);
     SetConfigUInt16(FW_CFG_MAX_CPUS, num_vcpus);
     uint64_t numa_cfg[num_vcpus + 1] = { 0 };
     SetConfigBytes(FW_CFG_NUMA, std::string((const char*)numa_cfg, sizeof(numa_cfg)));
     SetConfigUInt16(FW_CFG_NOGRAPHIC, 0);
     SetConfigUInt32(FW_CFG_IRQ0_OVERRIDE, 1);
-    SetConfigUInt16(FW_CFG_BOOT_MENU, 2); // show menu if more than 1 drives
+
+    auto cdrom = machine->LookupObjectByClass("AhciCdrom");
+    if (cdrom && cdrom->has_key("image")) {
+      SetConfigUInt16(FW_CFG_BOOT_MENU, 2); // show menu if more than 1 drives
+    } else {
+      SetConfigUInt16(FW_CFG_BOOT_MENU, 0);
+    }
 
     InitializeE820Table();
 
@@ -142,7 +150,7 @@ class FirmwareConfig : public Device {
   void InitializeFileDir() {
     fw_cfg_files dir;
     int index = 0;
-    for (auto item : files_) {
+    for (auto &item : files_) {
       auto cfg_file = &dir.files[index];
       strncpy(cfg_file->name, item.first.c_str(), item.first.size());
       cfg_file->size = htobe32(item.second.size());
@@ -161,13 +169,13 @@ class FirmwareConfig : public Device {
   }
 
   void InitializeE820Table() {
-    MemoryManager* memory = manager_->machine()->memory_manager();
+    MemoryManager* mm = manager_->machine()->memory_manager();
     std::vector<e820_entry> entries;
-    for (auto region : memory->regions()) {
+    for (auto slot : mm->GetMemoryFlatView()) {
       e820_entry entry;
-      entry.address = region->gpa;
-      entry.length = region->size;
-      if (region->type == kMemoryTypeRam) {
+      entry.address = slot->begin;
+      entry.length = slot->end - slot->begin;
+      if (slot->region->type == kMemoryTypeRam) {
         entry.type = E820_RAM;
       } else {
         entry.type = E820_RESERVED;
@@ -190,11 +198,31 @@ class FirmwareConfig : public Device {
     Device::Connect();
   }
 
-  void Write(const IoResource& ir, uint64_t offset, uint8_t* data, uint32_t size) {
-    if (ir.base == FW_CFG_IO_BASE && size == 2) {
+  bool SaveState(MigrationWriter* writer) {
+    FirmwareConfigState state;
+    state.set_current_index(current_index_);
+    state.set_current_offset(current_offset_);
+    state.set_dma_address(dma_address_);
+    writer->WriteProtobuf("FIRMWARE_CONFIG", state);
+    return Device::SaveState(writer);
+  }
+
+  bool LoadState(MigrationReader* reader) {
+    FirmwareConfigState state;
+    if (!reader->ReadProtobuf("FIRMWARE_CONFIG", state)) {
+      return false;
+    }
+    current_index_ = state.current_index();
+    current_offset_ = state.current_offset();
+    dma_address_ = state.dma_address();
+    return Device::LoadState(reader);
+  }
+
+  void Write(const IoResource* resource, uint64_t offset, uint8_t* data, uint32_t size) {
+    if (resource->base == FW_CFG_IO_BASE && size == 2) {
       current_index_ = *(uint16_t*)data;
       current_offset_ = 0;
-    } else if (ir.base == FW_CFG_DMA_IO_BASE) {
+    } else if (resource->base == FW_CFG_DMA_IO_BASE) {
       if (size == 4) {
         if (offset == 0) { // High 32bit address
           dma_address_ = be32toh(*(uint32_t*)data);
@@ -209,12 +237,12 @@ class FirmwareConfig : public Device {
       }
     } else {
       MV_PANIC("not implemented Write for %s base=0x%lx offset=0x%lx size=%d",
-        name_, ir.base, offset, size);
+        name_, resource->base, offset, size);
     }
   }
 
-  void Read(const IoResource& ir, uint64_t offset, uint8_t* data, uint32_t size) {
-    if (ir.base == FW_CFG_IO_BASE && offset == 1) {
+  void Read(const IoResource* resource, uint64_t offset, uint8_t* data, uint32_t size) {
+    if (resource->base == FW_CFG_IO_BASE && offset == 1) {
       auto it = config_.find(current_index_);
       if (it == config_.end()) {
         MV_PANIC("config entry %d not found", current_index_);

@@ -21,11 +21,13 @@
 
 #include <cstring>
 #include <vector>
+
 #include "vga.h"
 #include "logger.h"
 #include "spice/qxl_dev.h"
 #include "qxl.modes.inc"
 #include "machine.h"
+#include "states/qxl.pb.h"
 
 #define NUM_MEMSLOTS 8
 #define MEMSLOT_GENERATION_BITS 8
@@ -33,7 +35,6 @@
 
 class Qxl : public Vga {
  private:
-  bool      qxl_on_;
   uint32_t  qxl_rom_size_;
   void*     qxl_rom_base_;
   uint32_t  qxl_vram32_size_;
@@ -47,8 +48,6 @@ class Qxl : public Vga {
   struct guest_slots {
     QXLMemSlot    slot;
     uint64_t      offset;
-    uint64_t      size;
-    uint64_t      delta;
     bool          active;
     uint8_t*      hva; 
   } guest_slots_[NUM_MEMSLOTS];
@@ -60,20 +59,16 @@ class Qxl : public Vga {
     uint32_t          abs_stride;
     uint32_t          bits_pp;
     uint32_t          bytes_pp;
-    uint8_t*          data;
   } guest_primary_;
 
  public:
   Qxl() {
     pci_header_.vendor_id = 0x1B36;
     pci_header_.device_id = 0x0100;
-
-    AddPciBar(1, 8 << 20, kIoResourceTypeRam);      /* QXL VRAM32 8MB */
-    AddPciBar(2, 8192, kIoResourceTypeRam);         /* QXL ROM */
-    AddPciBar(3, 32, kIoResourceTypePio);           /* QXL PIO */
+    pci_header_.revision_id = 5;
     
-    /* Bar 1: 8MB */
-    qxl_vram32_size_ = 8 << 20;
+    /* Bar 1: 8MB, not used in Windows driver */
+    qxl_vram32_size_ = _MB(8);
     qxl_vram32_base_ = (uint8_t*)valloc(qxl_vram32_size_);
     pci_bars_[1].host_memory = qxl_vram32_base_;
 
@@ -81,14 +76,24 @@ class Qxl : public Vga {
     qxl_rom_size_ = 8192;
     qxl_rom_base_ = valloc(qxl_rom_size_);
     pci_bars_[2].host_memory = qxl_rom_base_;
+
+    AddPciBar(1, qxl_vram32_size_, kIoResourceTypeRam); /* QXL VRAM32 8MB */
+    AddPciBar(2, 8192, kIoResourceTypeRam);             /* QXL ROM */
+    AddPciBar(3, 32, kIoResourceTypePio);               /* QXL PIO */
     
+  }
+
+  virtual ~Qxl() {
+    if (qxl_vram32_base_) {
+      free(qxl_vram32_base_);
+    }
   }
 
   virtual bool ActivatePciBar(uint8_t index) {
     if (index == 3) {
       /* Setup ioeventfd for notify commands */
-      manager_->RegisterIoEvent(this, kIoResourceTypePio, pci_bars_[index].address + QXL_IO_NOTIFY_CMD, 1, 0);
-      manager_->RegisterIoEvent(this, kIoResourceTypePio, pci_bars_[index].address + QXL_IO_NOTIFY_CURSOR, 1, 0);
+      manager_->RegisterIoEvent(this, kIoResourceTypePio, pci_bars_[index].address + QXL_IO_NOTIFY_CMD);
+      manager_->RegisterIoEvent(this, kIoResourceTypePio, pci_bars_[index].address + QXL_IO_NOTIFY_CURSOR);
     }
     return Vga::ActivatePciBar(index);
   }
@@ -111,6 +116,71 @@ class Qxl : public Vga {
     // Reset cursor
     // Reset surfaces
     bzero(guest_slots_, sizeof(guest_slots_));
+    bzero(&guest_primary_, sizeof(guest_primary_));
+  }
+
+  virtual bool SaveState(MigrationWriter* writer) {
+    QxlState state;
+    for (int i = 0; i < NUM_MEMSLOTS; i++) {
+      auto slot = state.add_guest_slots();
+      slot->set_mem_start(guest_slots_[i].slot.mem_start);
+      slot->set_mem_end(guest_slots_[i].slot.mem_end);
+      slot->set_active(guest_slots_[i].active);
+    }
+    state.set_last_release_offset((uint64_t)last_relealse_info_ - (uint64_t)vram_base_);
+  
+    auto primary = state.mutable_guest_primary();
+    auto& surface = guest_primary_.surface;
+    primary->set_width(surface.width);
+    primary->set_height(surface.height);
+    primary->set_stride(surface.stride);
+    primary->set_format(surface.format);
+    primary->set_position(surface.position);
+    primary->set_mouse_mode(surface.mouse_mode);
+    primary->set_flags(surface.flags);
+    primary->set_type(surface.type);
+    primary->set_mem_address(surface.mem);
+    writer->WriteProtobuf("QXL", state);
+    return Vga::SaveState(writer);
+  }
+
+  /* Reset should be called before load state */
+  virtual bool LoadState(MigrationReader* reader) {
+    if (!Vga::LoadState(reader)) {
+      return false;
+    }
+    QxlState state;
+    if (!reader->ReadProtobuf("QXL", state)) {
+      return false;
+    }
+    for (int i = 0; i < NUM_MEMSLOTS && i < state.guest_slots_size(); i++) {
+      auto slot = state.guest_slots(i);
+      if (slot.active()) {
+        QXLMemSlot mem_slot = {
+          .mem_start = slot.mem_start(),
+          .mem_end = slot.mem_end()
+        };
+        AddMemSlot(i, mem_slot);
+      }
+    }
+    last_relealse_info_ = (QXLReleaseInfo*)(vram_base_ + state.last_release_offset());
+
+    auto& primary = state.guest_primary();
+    QXLSurfaceCreate create = {
+      .width = primary.width(),
+      .height = primary.height(),
+      .stride = primary.stride(),
+      .format = primary.format(),
+      .position = primary.position(),
+      .mouse_mode = primary.mouse_mode(),
+      .flags = primary.flags(),
+      .type = primary.type(),
+      .mem = primary.mem_address()
+    };
+    if (create.width && create.height) {
+      CreatePrimarySurface(create);
+    }
+    return true;
   }
 
   void IntializeQxlRom() {
@@ -120,7 +190,7 @@ class Qxl : public Vga {
     QXLModes* modes = (QXLModes*)(rom + 1);
     rom->magic = QXL_ROM_MAGIC;
     rom->id = 0;
-    rom->log_level = 1; /* Guest debug on */
+    rom->log_level = 0; /* Guest debug */
     rom->modes_offset = sizeof(QXLRom);
 
     rom->slot_gen_bits = MEMSLOT_GENERATION_BITS;
@@ -173,9 +243,43 @@ class Qxl : public Vga {
     ring->items[prod].el = 0;
   }
 
-  virtual void Write(const IoResource& ir, uint64_t offset, uint8_t* data, uint32_t size) {
-    if (ir.base == pci_bars_[3].address) {
-      switch (offset)
+  uint64_t TranslateAsyncCommand(uint64_t command, bool* async) {
+    *async = true;
+    switch (command)
+    {
+    case QXL_IO_UPDATE_AREA_ASYNC:
+      command = QXL_IO_UPDATE_AREA;
+      break;
+    case QXL_IO_MEMSLOT_ADD_ASYNC:
+      command = QXL_IO_MEMSLOT_ADD;
+      break;
+    case QXL_IO_CREATE_PRIMARY_ASYNC:
+      command = QXL_IO_CREATE_PRIMARY;
+      break;
+    case QXL_IO_DESTROY_PRIMARY_ASYNC:
+      command = QXL_IO_DESTROY_PRIMARY;
+      break;
+    case QXL_IO_DESTROY_SURFACE_ASYNC:
+      command = QXL_IO_DESTROY_SURFACE_WAIT;
+      break;
+    case QXL_IO_DESTROY_ALL_SURFACES_ASYNC:
+      command = QXL_IO_DESTROY_ALL_SURFACES;
+      break;
+    case QXL_IO_FLUSH_SURFACES_ASYNC:
+    case QXL_IO_MONITORS_CONFIG_ASYNC:
+      break;
+    default:
+      *async = false;
+      break;
+    }
+    return command;
+  }
+
+  virtual void Write(const IoResource* resource, uint64_t offset, uint8_t* data, uint32_t size) {
+    if (resource->base == pci_bars_[3].address) {
+      bool async;
+      uint64_t command = TranslateAsyncCommand(offset, &async);
+      switch (command)
       {
       case QXL_IO_NOTIFY_CMD:
         FetchGraphicsCommands();
@@ -193,6 +297,7 @@ class Qxl : public Vga {
         AddMemSlot(*data, qxl_ram_->mem_slot);
         break;
       case QXL_IO_CREATE_PRIMARY:
+      case QXL_IO_CREATE_PRIMARY_ASYNC:
         CreatePrimarySurface(qxl_ram_->create_surface);
         break;
       case QXL_IO_DESTROY_PRIMARY:
@@ -209,8 +314,14 @@ class Qxl : public Vga {
           offset, *(uint64_t*)data, size);
         break;
       }
+      if (async) {
+        if (debug_) {
+          MV_LOG("complete cmd=0x%x", offset);
+        }
+        SetInterrupt(QXL_INTERRUPT_IO_CMD);
+      }
     } else {
-      Vga::Write(ir, offset, data, size);
+      Vga::Write(resource, offset, data, size);
     }
   }
 
@@ -231,7 +342,6 @@ class Qxl : public Vga {
 
     guest_slots_[slot_id].slot = slot;
     guest_slots_[slot_id].offset = slot.mem_start - pci_bars_[bar_index].address;
-    guest_slots_[slot_id].size = slot.mem_end - slot.mem_start;
     guest_slots_[slot_id].hva = (uint8_t*)pci_bars_[bar_index].host_memory + guest_slots_[slot_id].offset;
     guest_slots_[slot_id].active = true;
   }
@@ -252,15 +362,28 @@ class Qxl : public Vga {
       MV_PANIC("unsupported surface format=0x%x", create.format);
       break;
     }
-    mode_ = kDisplayQxlMode;
-    width_ = create.width;
-    height_ = create.height;
-    bpp_ = guest_primary_.bits_pp;
-    NotifyDisplayModeChange();
+    bool changed = (mode_ != kDisplayQxlMode) || (width_ != create.width) ||
+      (height_ != create.height) || (bpp_ != guest_primary_.bits_pp);
+    if (changed) {
+      UpdateDisplayMode();
+    }
   }
 
   void DestroyPrimarySurface() {
     /* Maybe we should notify the viewer??? */
+    bzero(&guest_primary_, sizeof(guest_primary_));
+  }
+
+  virtual void UpdateDisplayMode() {
+    if (guest_primary_.resized) {
+      mode_ = kDisplayQxlMode;
+      width_ = guest_primary_.surface.width;
+      height_ = guest_primary_.surface.height;
+      bpp_ = guest_primary_.bits_pp;
+      NotifyDisplayModeChange();
+    } else {
+      Vga::UpdateDisplayMode();
+    }
   }
 
   virtual void GetDisplayMode(uint16_t* w, uint16_t* h, uint16_t* bpp) {
@@ -435,22 +558,29 @@ class Qxl : public Vga {
       QXLCopy* copy = &drawable->u.copy;
       MV_ASSERT(drawable->effect == QXL_EFFECT_OPAQUE);
       MV_ASSERT(drawable->clip.type == SPICE_CLIP_TYPE_NONE);
-      MV_ASSERT(drawable->self_bitmap == 1);
-      MV_ASSERT(drawable->self_bitmap_area.left == drawable->bbox.left && drawable->self_bitmap_area.right == drawable->bbox.right);
+      if (drawable->self_bitmap) {
+        MV_ASSERT(drawable->self_bitmap_area.left == drawable->bbox.left && drawable->self_bitmap_area.right == drawable->bbox.right);
+      }
       MV_ASSERT(copy->src_area.top == 0 && copy->src_area.left == 0);
       MV_ASSERT(copy->rop_descriptor == SPICE_ROPD_OP_PUT);
       QXLImage* image = (QXLImage*)GetMemSlotAddress(copy->src_bitmap);
       MV_ASSERT(image->descriptor.type == SPICE_IMAGE_TYPE_BITMAP);
       MV_ASSERT(image->descriptor.flags == 0);
+
       QXLBitmap* bitmap = &image->bitmap;
-      MV_ASSERT(bitmap->format == SPICE_BITMAP_FMT_RGBA);
+      if (bitmap->format != SPICE_BITMAP_FMT_RGBA) {
+        MV_LOG("invalid bitmap format=0x%x", bitmap->format);
+        ReleaseGuestResource(&drawable->release_info);
+        delete partial;
+        break;
+      }
       MV_ASSERT(bitmap->palette == 0);
       MV_ASSERT(bitmap->stride == bitmap->x * guest_primary_.bytes_pp);
       MV_ASSERT(partial->width == (int)bitmap->x && partial->height == (int)bitmap->y);
       partial->stride = bitmap->stride;
       partial->flip = !(bitmap->flags & QXL_BITMAP_TOP_DOWN);
       GetMemSlotChunkedData(bitmap->data, partial->vector);
-      partial->release = [=]() {
+      partial->Release = [=]() {
         ReleaseGuestResource(&drawable->release_info);
         delete partial;
       };
@@ -471,7 +601,7 @@ class Qxl : public Vga {
         .data = data,
         .size = size
       });
-      partial->release = [=]() {
+      partial->Release = [=]() {
         ReleaseGuestResource(&drawable->release_info);
         delete data;
         delete partial;
@@ -492,7 +622,7 @@ class Qxl : public Vga {
     {
     case QXL_CURSOR_HIDE:
       update->command = kDisplayCursorUpdateHide;
-      update->release = [=]() {
+      update->Release = [=]() {
         ReleaseGuestResource(&cursor->release_info);
         delete update;
       };
@@ -501,7 +631,7 @@ class Qxl : public Vga {
       update->command = kDisplayCursorUpdateMove;
       update->move.x = cursor->u.position.x;
       update->move.y = cursor->u.position.y;
-      update->release = [=]() {
+      update->Release = [=]() {
         ReleaseGuestResource(&cursor->release_info);
         delete update;
       };
@@ -519,7 +649,7 @@ class Qxl : public Vga {
       update->set.hotspot_x = shape->header.hot_spot_x;
       update->set.hotspot_y = shape->header.hot_spot_y;
       GetMemSlotLinearizedData(&shape->chunk, &update->set.data, &update->set.size);
-      update->release = [=]() {
+      update->Release = [=]() {
         ReleaseGuestResource(&cursor->release_info);
         delete[] update->set.data;
         delete update;

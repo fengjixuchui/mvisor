@@ -18,15 +18,19 @@
 
 
 #include "machine.h"
+
 #include <linux/kvm.h>
 #include <sys/ioctl.h>
-#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
+
+#include <filesystem>
+
+#include "logger.h"
 #include "disk_image.h"
 #include "device_interface.h"
-#include "logger.h"
+#include "migration.h"
 
 #define X86_EPT_IDENTITY_BASE 0xfeffc000
 
@@ -46,17 +50,18 @@ Machine::Machine(std::string config_path) {
   memory_manager_ = new MemoryManager(this);
 
   CreateArchRelated();
-  CreateVcpu();
 
   /* Currently, a Q35 chipset mother board is implemented */
   Device* root = dynamic_cast<Device*>(LookupObjectByName("system-root"));
   if (!root) {
     MV_PANIC("failed to find system-root device");
   }
-  device_manager_ = new DeviceManager(this, root);
+  /* Initialize IO thread before devices */
   io_thread_ = new IoThread(this);
-
-  LoadBiosFile();
+  /* Initialize device manager, connect and reset all devices */
+  device_manager_ = new DeviceManager(this, root);
+  /* Create vcpu objects */
+  CreateVcpu();
 }
 
 /* Free VM resources */
@@ -67,10 +72,10 @@ Machine::~Machine() {
   for (auto vcpu: vcpus_) {
     delete vcpu;
   }
-  delete io_thread_;
 
   delete device_manager_;
   delete memory_manager_;
+  delete io_thread_;
 
   // delete objects created by confiration
   for (auto it = objects_.begin(); it != objects_.end(); it++) {
@@ -78,13 +83,9 @@ Machine::~Machine() {
   }
 
   if (vm_fd_ > 0)
-    close(vm_fd_);
+    safe_close(&vm_fd_);
   if (kvm_fd_ > 0)
-    close(kvm_fd_);
-  if (bios_data_)
-    free(bios_data_);
-  if (bios_backup_)
-    free(bios_backup_);
+    safe_close(&kvm_fd_);
 }
 
 void Machine::InitializeKvm() {
@@ -104,26 +105,6 @@ void Machine::InitializeKvm() {
   // Create vm so that we can map userspace memory
   vm_fd_ = ioctl(kvm_fd_, KVM_CREATE_VM, 0);
   MV_ASSERT(vm_fd_ > 0);
-}
-
-/* SeaBIOS is loaded into the end of 1MB and the end of 4GB */
-void Machine::LoadBiosFile() {
-  // Read BIOS data from path to bios_data
-  int fd = open(bios_path_.c_str(), O_RDONLY);
-  MV_ASSERT(fd > 0);
-  struct stat st;
-  fstat(fd, &st);
-
-  bios_size_ = st.st_size;
-  bios_backup_ = malloc(bios_size_);
-  read(fd, bios_backup_, bios_size_);
-  close(fd);
-
-  bios_data_ = valloc(bios_size_);
-  memcpy(bios_data_, bios_backup_, bios_size_);
-  // Map BIOS file to memory
-  memory_manager_->Map(0x100000 - bios_size_, bios_size_, bios_data_, kMemoryTypeRam, "seabios");
-  memory_manager_->Map(0x100000000 - bios_size_, bios_size_, bios_data_, kMemoryTypeRam, "seabios");
 }
 
 
@@ -150,18 +131,7 @@ void Machine::CreateArchRelated() {
   }
   
   /* Map these addresses as reserved so the guest never touch it */
-  memory_manager_->Map(X86_EPT_IDENTITY_BASE, 4 * PAGE_SIZE, nullptr, kMemoryTypeReserved, "ept+tss");
-
-  // Use Kvm in-kernel IRQChip
-  if (ioctl(vm_fd_, KVM_CREATE_IRQCHIP) < 0) {
-    MV_PANIC("failed to create irqchip");
-  }
-
-  // Use Kvm in-kernel PITClock
-  struct kvm_pit_config pit_config = { 0 };
-  if (ioctl(vm_fd_, KVM_CREATE_PIT2, &pit_config) < 0) {
-    MV_PANIC("failed to create pit");
-  }
+  memory_manager_->Map(X86_EPT_IDENTITY_BASE, 4 * PAGE_SIZE, nullptr, kMemoryTypeReserved, "EPT+TSS");
 }
 
 void Machine::CreateVcpu() {
@@ -173,14 +143,19 @@ void Machine::CreateVcpu() {
 
 
 /* Start vCPU threads and IO thread */
-int Machine::Run() {
+void Machine::Run() {
+  if (config_->snapshot()) {
+    auto path = std::filesystem::path(config_->path());
+    Load(path.parent_path());
+  }
+  
+  /* Set paused = false */
+  Resume();
+
   for (auto vcpu: vcpus_) {
     vcpu->Start();
   }
-
-  // Not used yet
-  // io_thread_->Start();
-  return 0;
+  io_thread_->Start();
 }
 
 /* Maybe there are lots of things to do before quiting a VM */
@@ -189,19 +164,25 @@ void Machine::Quit() {
     return;
   valid_ = false;
 
+  /* If paused, threads are waiting to resume */
+  wait_to_resume_.notify_all();
+
   for (auto vcpu: vcpus_) {
     vcpu->Kick();
   }
+  io_thread_->Stop();
 }
 
 /* Recover BIOS data and reset all vCPU
  * FIXME: vCPU 0 sometimes hangs (CPU 100%) after reset
  */
 void Machine::Reset() {
-  memcpy(bios_data_, bios_backup_, bios_size_);
+  memory_manager_->ResetBios();
   device_manager_->ResetDevices();
 
-  MV_LOG("Resettings vCPUs");
+  if (debug_) {
+    MV_LOG("Resettings vCPUs");
+  }
   for (auto vcpu: vcpus_) {
     vcpu->Schedule([vcpu]() {
       vcpu->Reset();
@@ -228,3 +209,132 @@ Object* Machine::LookupObjectByClass(std::string name) {
   return nullptr;
 }
 
+std::vector<Object*> Machine::LookupObjects(std::function<bool (Object*)> compare) {
+  std::vector<Object*> result;
+  for (auto it = objects_.begin(); it != objects_.end(); it++) {
+    if (compare(it->second)) {
+      result.push_back(it->second);
+    }
+  }
+  return result;
+}
+
+/* Resume from paused state */
+void Machine::Resume() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  MV_ASSERT(paused_);
+  MV_ASSERT(wait_count_ == 0);
+  paused_ = false;
+
+  /* Resume threads */
+  wait_to_resume_.notify_all();
+
+  /* Here all the threads are running, broadcast messages */
+  for (auto &callback : state_change_listeners_) {
+    callback();
+  }
+}
+
+/* Currently this method can only be called from UI threads */
+void Machine::Pause() {
+  /* Mark paused state and wait for vCPU threads and IO thread to stop */
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (!valid_ || paused_)
+    return;
+  paused_ = true;
+  io_thread_->FlushDiskImages();
+
+  wait_count_ = num_vcpus_ + 1;
+  for (auto vcpu : vcpus_) {
+    vcpu->Kick();
+  }
+  io_thread_->Kick();
+
+  wait_to_pause_condition_.wait(lock, [this]() {
+    return wait_count_ == 0;
+  });
+
+  /* Here all the threads are stopped, broadcast messages */
+  for (auto &callback : state_change_listeners_) {
+    callback();
+  }
+}
+
+/* vCPU threads and IO threads call this method to sleep */
+void Machine::WaitToResume() {
+  std::unique_lock<std::mutex> lock(mutex_);  
+  MV_ASSERT(wait_count_ > 0);
+  wait_count_--;
+  wait_to_pause_condition_.notify_all();
+  wait_to_resume_.wait(lock, [this]() {
+    return !IsPaused();
+  });
+}
+
+/* Listeners are called after Pause / Resume */
+void Machine::RegisterStateChangeListener(VoidCallback callback) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  state_change_listeners_.push_back(callback);
+}
+
+/* Should call by UI thread */
+void Machine::Save(std::string path) {
+  /* Make sure the machine is paused */
+  if (!IsPaused()) {
+    Pause();
+  }
+  MV_LOG("start saving");
+
+  MigrationWriter writer(path);
+  /* Save vcpu states */
+  for (auto vcpu : vcpus_) {
+    vcpu->SaveState(&writer);
+  }
+  /* Save device states */
+  if (!device_manager_->SaveState(&writer)) {
+    MV_PANIC("failed to save device states");
+    return;
+  }
+  /* Save system RAM */
+  if (!memory_manager_->SaveState(&writer)) {
+    MV_PANIC("failed to save RAM");
+    return;
+  }
+  /* Save disk images */
+  if (!io_thread_->SaveDiskImage(&writer)) {
+    MV_PANIC("failed to sync disk images");
+    return;
+  }
+  /* Save configuration after saving disk images (paths might changed) */
+  if (!config_->Save(path + "/configuration.yaml")) {
+    MV_PANIC("failed to save configuration yaml");
+    return;
+  }
+  MV_LOG("done saving");
+}
+
+/* Should call by UI thread */
+void Machine::Load(std::string path) {
+  /* Make sure the machine is paused */
+  if (!IsPaused()) {
+    Pause();
+  }
+  MV_LOG("start loading");
+
+  MigrationReader reader(path);
+  /* Load system RAM */
+  if (!memory_manager_->LoadState(&reader)) {
+    MV_PANIC("failed to load RAM");
+  }
+  /* Load device states */
+  if (!device_manager_->LoadState(&reader)) {
+    MV_PANIC("failed to load device states");
+  }
+  /* Load vcpu states */
+  for (auto vcpu : vcpus_) {
+    if (!vcpu->LoadState(&reader)) {
+      MV_PANIC("failed to load %s", vcpu->name());
+    }
+  }
+  MV_LOG("done loading");
+}

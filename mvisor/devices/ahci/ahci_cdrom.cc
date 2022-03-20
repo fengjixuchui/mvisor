@@ -17,11 +17,14 @@
  */
 
 #include "ide_storage.h"
+
 #include <cstring>
+
 #include "logger.h"
 #include "ahci_port.h"
 #include "ata_interval.h"
 #include "disk_image.h"
+#include "states/ahci_cdrom.pb.h"
 
 /*
  *  SENSE KEYS
@@ -84,7 +87,7 @@ AhciCdrom::AhciCdrom()
 
   drive_info_.world_wide_name = rand();
   sprintf(drive_info_.serial, "TC%05ld", drive_info_.world_wide_name);
-  sprintf(drive_info_.model, "NUWA DVD-ROM");
+  sprintf(drive_info_.model, "DVD-ROM");
   sprintf(drive_info_.version, "1.0");
 
   /* ATA command handlers */
@@ -137,7 +140,10 @@ AhciCdrom::AhciCdrom()
     CBD_RW_DATA10* p = (CBD_RW_DATA10*)io_.atapi_command;
     io_.lba_block = be32toh(p->lba);
     io_.lba_count = be16toh(p->count);
-    Atapi_ReadSectors();
+    if (debug_) {
+      MV_LOG("ATAPI read block=0x%lx count=0x%lx", io_.lba_block, io_.lba_count);
+    }
+    Atapi_ReadSectorsAsync();
   };
   
   atapi_handlers_[0x2B] = [=] () { // seek
@@ -184,10 +190,10 @@ void AhciCdrom::Connect() {
   }
 }
 
-void AhciCdrom::SetError(int sense_key, int asc) {
+void AhciCdrom::SetError(uint sense_key, uint asc) {
   regs_.error = sense_key << 4;
   regs_.status = ATA_SR_DRDY | ATA_SR_ERR;
-  regs_.count0 |= (regs_.count0 & ~7);
+  regs_.count0 = (regs_.count0 & ~7) | ATA_CB_SC_P_CD | ATA_CB_SC_P_IO;
   sense_key_ = sense_key;
   asc_ = asc;
 }
@@ -206,19 +212,25 @@ void AhciCdrom::ParseCommandPacket() {
   }
 }
 
-void AhciCdrom::Atapi_ReadSectors() {
+void AhciCdrom::Atapi_ReadSectorsAsync() {
+  io_async_ = true;
   size_t vec_index = 0;
   size_t position = io_.lba_block * track_size_;
-  size_t remain_bytes = io_.lba_count * track_size_;
+  size_t total_bytes = io_.lba_count * track_size_;
+  size_t remain_bytes = total_bytes;
   while (remain_bytes > 0 && vec_index < io_.vector.size()) {
-    auto iov = io_.vector[vec_index];
+    auto &iov = io_.vector[vec_index];
   
     auto length = remain_bytes < iov.iov_len ? remain_bytes : iov.iov_len;
     
-    image_->Read(iov.iov_base, position, length);
+    image_->ReadAsync(iov.iov_base, position, length, [this, length, total_bytes](ssize_t ret) {
+      io_.nbytes += length;
+      if (io_.nbytes == (ssize_t)total_bytes) {
+        CompleteCommand();
+      }
+    });
     position += length;
     remain_bytes -= length;
-    io_.nbytes += length;
     ++vec_index;
   }
 }
@@ -317,7 +329,7 @@ void AhciCdrom::Atapi_Inquiry() {
   buf[5] = 0;    /* reserved */
   buf[6] = 0;    /* reserved */
   buf[7] = 0;    /* reserved */
-  padstr8(buf + 8, 8, "TENCLASS");
+  padstr8(buf + 8, 8, "Tenclass");
   padstr8(buf + 16, 16, drive_info_.model);
   padstr8(buf + 32, 4, drive_info_.version);
   io_.nbytes = size > 36 ? 36 : size;
@@ -372,6 +384,25 @@ void AhciCdrom::Atapi_IdentifyData() {
 
   io_.nbytes = io_.buffer_size < 512 ? io_.buffer_size : 512;
   memcpy(io_.buffer, p, io_.nbytes);
+}
+
+
+bool AhciCdrom::SaveState(MigrationWriter* writer) {
+  AhciCdromState state;
+  state.set_sense_key(sense_key_);
+  state.set_asc(asc_);
+  writer->WriteProtobuf("CDROM", state);
+  return IdeStorageDevice::SaveState(writer);
+}
+
+bool AhciCdrom::LoadState(MigrationReader* reader) {
+  AhciCdromState state;
+  if (!reader->ReadProtobuf("CDROM", state)) {
+    return false;
+  }
+  sense_key_ = state.sense_key();
+  asc_ = state.asc();
+  return true;
 }
 
 DECLARE_DEVICE(AhciCdrom);

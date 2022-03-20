@@ -19,43 +19,76 @@
 #ifndef _MVISOR_IO_THREAD_H
 #define _MVISOR_IO_THREAD_H
 
-#include <libaio.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
+
+#include <deque>
+#include <unordered_set>
+#include <unordered_map>
 #include <thread>
 #include <functional>
+#include <chrono>
+#include <mutex>
 
-enum IoRequestType {
-  kIoRequestRead,
-  kIoRequestWrite
+typedef std::function<void()> VoidCallback;
+typedef std::function<void(long)> IoCallback;
+typedef std::chrono::steady_clock::time_point IoTimePoint;
+
+struct IoTimer {
+  bool          permanent;
+  int           interval_ms;
+  IoTimePoint   next_timepoint;
+  VoidCallback  callback;
+  bool          removed;
 };
 
-typedef std::function<void()> IoCallback;
-struct IoRequest {
-  enum IoRequestType type;
-  IoCallback callback;
-  // io control block ??
-  struct iocb iocb;
+struct EpollEvent {
+  int           fd;
+  IoCallback    callback;
+  epoll_event   event;
 };
 
 class Machine;
-
+class DiskImage;
+class MigrationWriter;
 class IoThread {
  public:
   IoThread(Machine* machine);
   ~IoThread();
-
   void Start();
-  const IoRequest* QueueIo(IoRequestType type, int fd, void* buffer, size_t bytes,
-    off_t offset, IoCallback callback);
-  const IoRequest* QueueIov(IoRequestType type, int fd, const struct iovec* iov, int iov_count,
-    off_t offset, IoCallback callback);
-  void CancelIo(const IoRequest* request);
+  void Stop();
+  void Kick();
+
+  /* Async event polling */
+  EpollEvent* StartPolling(int fd, uint poll_mask, IoCallback callback);
+  void ModifyPolling(int fd, uint poll_mask);
+  void StopPolling(int fd);
+
+  /* Timer events handled by IO thread */
+  IoTimer* AddTimer(int interval_ms, bool permanent, VoidCallback callback);
+  void RemoveTimer(IoTimer* timer);
+  void ModifyTimer(IoTimer* timer, int interval_ms);
+  void Schedule(VoidCallback callback);
+
+  /* Disk images */
+  void RegisterDiskImage(DiskImage* image);
+  void UnregisterDiskImage(DiskImage* image);
+  void FlushDiskImages();
+  bool CanPauseNow();
+  bool SaveDiskImage(MigrationWriter* writer);
 
  private:
-  void EventLoop();
+  void RunLoop();
+  int  CheckTimers();
 
-  std::thread thread_;
-  Machine* machine_;
-  io_context_t context_;
+  std::thread           thread_;
+  Machine*              machine_;
+  std::recursive_mutex  mutex_;
+  int                   event_fd_;
+  int                   epoll_fd_;
+  std::unordered_set<IoTimer*>          timers_;
+  std::unordered_map<int, EpollEvent*>  epoll_events_;
+  std::unordered_set<DiskImage*>        disk_images_;
 };
 
 #endif // _MVISOR_IO_THREAD_H

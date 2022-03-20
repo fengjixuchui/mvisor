@@ -18,22 +18,21 @@
 
 #include "uip.h"
 #include <arpa/inet.h>
-#include <fcntl.h>
-#include <sys/epoll.h>
-#include "logger.h"
-#include "device_manager.h"
 
 
-UdpSocket::UdpSocket(NetworkBackendInterface* backend, ethhdr* eth, iphdr* ip, udphdr* udp) :
-  Ipv4Socket(backend, eth, ip) {
+UdpSocket::UdpSocket(NetworkBackendInterface* backend, Ipv4Packet* packet) :
+  Ipv4Socket(backend, packet) {
+  auto udp = packet->udp;
   sport_ = ntohs(udp->source);
   dport_ = ntohs(udp->dest);
 }
 
-Ipv4Packet* UdpSocket::AllocatePacket() {
-  Ipv4Packet* packet = Ipv4Socket::AllocatePacket();
-  packet->udp = (udphdr*)packet->data;
-  packet->data = (void*)&packet->udp[1];
+Ipv4Packet* UdpSocket::AllocatePacket(bool urgent) {
+  Ipv4Packet* packet = Ipv4Socket::AllocatePacket(urgent);
+  if (packet) {
+    packet->udp = (udphdr*)packet->data;
+    packet->data = (void*)&packet->udp[1];
+  }
   return packet;
 }
 
@@ -89,78 +88,5 @@ void UdpSocket::OnDataFromHost(Ipv4Packet* packet) {
   ip->check = CalculateChecksum((uint8_t*)ip, ip->ihl * 4);
   udp->check = CalculateUdpChecksum(packet);
 
-  size_t packet_length = sizeof(ethhdr) + ntohs(ip->tot_len);
-  backend_->OnFrameFromHost(ETH_P_IP, packet->buffer, packet_length);
-
-  active_time_ = time(nullptr);
-}
-
-RedirectUdpSocket::~RedirectUdpSocket() {
-  if (fd_ > 0) {
-    Device* device = dynamic_cast<Device*>(backend_->device());
-    device->manager()->UnregisterIoEvent(device, fd_);
-  }
-}
-
-bool RedirectUdpSocket::IsActive() {
-  // Kill timedout
-  if (time(nullptr) - active_time_ >= REDIRECT_TIMEOUT_SECONDS) {
-    return false;
-  }
-  return UdpSocket::IsActive();
-}
-
-void RedirectUdpSocket::InitializeRedirect() {
-  fd_ = socket(AF_INET, SOCK_DGRAM, 0);
-  MV_ASSERT(fd_ >= 0);
-
-  // Set non-blocking
-  int flags = fcntl(fd_, F_GETFL, 0);
-  flags |= O_NONBLOCK;
-  fcntl(fd_, F_SETFL, flags);
-
-  Device* device = dynamic_cast<Device*>(backend_->device());
-  device->manager()->RegisterIoEvent(device, fd_, EPOLLIN, [=](uint32_t events) {
-    if (events & EPOLLIN) {
-      OnRemoteDataAvailable();
-    }
-  });
-
-  debug_ = device->debug();
-  if (debug_) {
-    MV_LOG("UDP fd=%d %x:%u -> %x:%u", fd_, sip_, sport_, dip_, dport_);
-  }
-}
-
-void RedirectUdpSocket::OnRemoteDataAvailable() {
-  auto packet = AllocatePacket();
-  int ret = recvfrom(fd_, packet->data, UIP_MAX_UDP_PAYLOAD, 0, nullptr, nullptr);
-  if (ret == -1) {
-    MV_PANIC("failed to recvfrom fd=%d ret=%d", fd_, ret);
-  }
-  if (ret < 0) {
-    FreePacket(packet);
-    return;
-  }
-  
-  packet->data_length = ret;
-  OnDataFromHost(packet);
-  FreePacket(packet);
-}
-
-void RedirectUdpSocket::OnDataFromGuest(void* data, size_t length) {
-  sockaddr_in daddr = {
-    .sin_family = AF_INET,
-    .sin_port = htons(dport_),
-    .sin_addr = {
-      .s_addr = htonl(dip_)
-    }
-  };
-  int ret = sendto(fd_, data, length, 0, (struct sockaddr*)&daddr, sizeof(daddr));
-  if (ret != (int)length) {
-    if (ret < 0) {
-      return;
-    }
-    MV_PANIC("failed to send all UDP data, length=%lu, ret=%d", length, ret);
-  }
+  backend_->OnPacketFromHost(packet);
 }

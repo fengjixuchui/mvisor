@@ -32,17 +32,27 @@ class Configuration {
  public:
   Configuration(Machine* machine);
   bool Load(std::string path);
+  bool Save(std::string path);
   std::string FindPath(std::string path) const;
+
+  inline bool snapshot() const { return snapshot_; }
+  inline const std::string& path() const { return path_; }
+  inline const std::string& bios_path() const { return bios_path_; }
 
  private:
   void InitializePaths();
   bool LoadFile(std::string path);
-  void LoadMachine(YAML::Node node);
-  void LoadObjects(YAML::Node node);
+  void LoadMachine(const YAML::Node& node);
+  void LoadObjects(const YAML::Node& node);
+  void SaveMachine(YAML::Node& node);
+  void SetObjectKeyValue(Object* object, std::string key, const YAML::Node& value);
 
   Machine*    machine_;
   Device*     root_;
   std::set<std::string> directories_;
+  bool        snapshot_;
+  std::string path_;
+  std::string bios_path_;
 };
 
 #endif // _MVISOR_CONFIG_H

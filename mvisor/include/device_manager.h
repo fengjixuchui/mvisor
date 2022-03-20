@@ -23,19 +23,20 @@
 #include <string>
 #include <deque>
 #include <mutex>
+#include <vector>
 #include <thread>
 #include "pci_device.h"
 #include "device.h"
+#include "io_thread.h"
 
 struct MemoryRegion;
 struct IoHandler {
-  IoResource io_resource;
-  Device* device;
+  const IoResource*   resource;
+  Device*             device;
   const MemoryRegion* memory_region;
 };
 
 typedef std::function<void()> VoidCallback;
-typedef std::function<void(uint32_t)> EventsCallback;
 
 enum IoEventType {
   kIoEventPio,
@@ -51,17 +52,12 @@ struct IoEvent {
   uint64_t        datamatch;
   uint32_t        flags;
   int             fd;
-  EventsCallback  callback;
 };
 
-/* Currently used for VGA auto refresh */
-typedef std::chrono::steady_clock::time_point IoTimePoint;
-struct IoTimer {
-  Device*       device;
-  bool          permanent;
-  int           interval_ms;
-  IoTimePoint   next_timepoint;
-  VoidCallback  callback;
+struct IoAccounting {
+  IoTimePoint     last_print_time;
+  uint            total_pio = 0;
+  uint            total_mmio = 0;
 };
 
 class Machine;
@@ -73,49 +69,59 @@ class DeviceManager {
   void RegisterDevice(Device* device);
   void UnregisterDevice(Device* device);
   void ResetDevices();
+  void RegisterVfioGroup(int group_fd);
+  void UnregisterVfioGroup(int group_fd);
 
-  void RegisterIoHandler(Device* device, const IoResource& io_resource);
-  void UnregisterIoHandler(Device* device, const IoResource& io_resource);
-  void RegisterIoEvent(Device* device, IoResourceType type, uint64_t address, uint32_t length, uint64_t datamatch);
+  void RegisterIoHandler(Device* device, const IoResource* resource);
+  void UnregisterIoHandler(Device* device, const IoResource* resource);
+  IoEvent* RegisterIoEvent(Device* device, IoResourceType type, uint64_t address);
+  IoEvent* RegisterIoEvent(Device* device, IoResourceType type, uint64_t address, uint32_t length, uint64_t datamatch);
   void UnregisterIoEvent(Device* device, IoResourceType type, uint64_t address);
-  void RegisterIoEvent(Device* device, int fd, uint32_t events, EventsCallback callback);
-  void UnregisterIoEvent(Device* device, int fd);
-  IoTimer* RegisterIoTimer(Device* device, int interval_ms, bool permanent, VoidCallback callback);
-  void UnregisterIoTimer(IoTimer* timer);
-  void ModifyIoTimer(IoTimer* timer, int interval_ms);
+  void UnregisterIoEvent(IoEvent* event);
+  void SetupCoalescingMmioRing(kvm_coalesced_mmio_ring* ring);
+  void FlushCoalescingMmioBuffer();
 
   void PrintDevices();
-  Device* LookupDeviceByName(const std::string name);
+  Device* LookupDeviceByClass(const std::string class_name);
   PciDevice* LookupPciDevice(uint16_t bus, uint8_t devfn);
 
   /* call by machine */
   void HandleIo(uint16_t port, uint8_t* data, uint16_t size, int is_write, uint32_t count, bool ioeventfd = false);
-  void HandleMmio(uint64_t base, uint8_t* data, uint16_t size, int is_write, bool ioeventfd = false);
+  void HandleMmio(uint64_t addr, uint8_t* data, uint16_t size, int is_write, bool ioeventfd = false);
 
   void* TranslateGuestMemory(uint64_t gpa);
+  bool SaveState(MigrationWriter* writer);
+  bool LoadState(MigrationReader* reader);
   
+  /* IRQ / MSIs all are GSIs */
   void SetIrq(uint32_t irq, uint32_t level);
   void SignalMsi(uint64_t address, uint32_t data);
+  int AddMsiRoute(uint64_t address, uint32_t data, int trigger_fd = -1);
+  void UpdateMsiRoute(int gsi, uint64_t address, uint32_t data, int trigger_fd = -1);
 
   inline Machine* machine() { return machine_; }
   inline Device* root() { return root_; }
+  IoThread* io();
 
  private:
-  void InitializeIoEvent();
-  void IoEventLoop();
-  int CheckIoTimers();
+  void SetupIrqChip();
+  void SetupGsiRoutingTable();
+  void UpdateGsiRoutingTable();
 
+ private:
   Machine*                machine_;
   Device*                 root_;
   std::set<Device*>       registered_devices_;
   std::deque<IoHandler*>  mmio_handlers_;
   std::deque<IoHandler*>  pio_handlers_;
-  std::thread             ioevent_thread_;
   std::set<IoEvent*>      ioevents_;
   std::recursive_mutex    mutex_;
-  int                     epoll_fd_ = -1;
-  int                     stop_event_fd_ = -1;
-  std::set<IoTimer*>      iotimers_;
+  std::vector<kvm_irq_routing_entry>  gsi_routing_table_;
+  int                     next_gsi_ = 0;
+  IoAccounting            io_accounting_;
+  int                     vfio_kvm_device_fd_ = -1;
+  kvm_coalesced_mmio_ring*  coalesced_mmio_ring_ = nullptr;
+  std::recursive_mutex    coalesced_mmio_ring_mutex_;
 };
 
 #endif // _MVISOR_DEVICE_MANAGER_H

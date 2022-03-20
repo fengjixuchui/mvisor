@@ -48,8 +48,8 @@ void Device::Connect() {
 
   connected_ = true;
   manager_->RegisterDevice(this);
-  for (auto ir : io_resources_) {
-    manager_->RegisterIoHandler(this, ir);
+  for (auto resource : io_resources_) {
+    manager_->RegisterIoHandler(this, resource);
   }
   if (parent_ && manager_->machine()->debug()) {
     MV_LOG("%s <= %s", parent_->name(), name_);
@@ -76,52 +76,91 @@ void Device::Disconnect() {
 }
 
 void Device::AddIoResource(IoResourceType type, uint64_t base, uint64_t length, const char* name) {
-  IoResource io_resource = {
+  AddIoResource(type, base, length, name, nullptr, kIoResourceFlagNone);
+}
+
+void Device::AddIoResource(IoResourceType type, uint64_t base, uint64_t length, const char* name, void* host_memory, IoResourceFlag flags) {
+  auto resource = new IoResource {
     .type = type,
     .base = base,
     .length = length,
-    .name = name
+    .name = name,
+    .host_memory = host_memory
   };
-  io_resources_.push_back(std::move(io_resource));
+  resource->flags = flags;
+  io_resources_.push_back(resource);
   if (connected_) {
-    manager_->RegisterIoHandler(this, io_resource);
+    SetIoResourceEnabled(resource, true);
   }
 }
 
 void Device::RemoveIoResource(IoResourceType type, const char* name) {
   for (auto it = io_resources_.begin(); it != io_resources_.end(); it++) {
-    if (it->type == type &&
-        (it->name == name ||
-          (name && it->name && strcmp(it->name, name) == 0)
-        )
+    auto resource = *it;
+    if (resource->type == type &&
+        (resource->name == name || (name && resource->name && strcmp(resource->name, name) == 0))
       ) {
       if (connected_) {
-        manager_->UnregisterIoHandler(this, *it);
+        SetIoResourceEnabled(resource, false);
       }
       io_resources_.erase(it);
-      break;
+      return;
     }
   }
 }
 
 void Device::RemoveIoResource(IoResourceType type, uint64_t base) {
   for (auto it = io_resources_.begin(); it != io_resources_.end(); it++) {
-    if (it->type == type && it->base == base) {
+    auto resource = *it;
+    if (resource->type == type && resource->base == base) {
       if (connected_) {
-        manager_->UnregisterIoHandler(this, *it);
+        SetIoResourceEnabled(resource, false);
       }
       io_resources_.erase(it);
-      break;
+      return;
     }
+  }
+  MV_PANIC("not found type=%d base=0x%lx", type, base);
+}
+
+void Device::SetIoResourceEnabled(IoResource* resource, bool enabled) {
+  if (enabled) {
+    MV_ASSERT(!resource->enabled);
+    if (resource->type == kIoResourceTypeRam) {
+      MV_ASSERT(resource->host_memory);
+      auto mm = manager_->machine()->memory_manager();
+      resource->mapped_region = mm->Map(resource->base, resource->length, resource->host_memory, kMemoryTypeRam, resource->name);
+    } else {
+      manager_->RegisterIoHandler(this, resource);
+    }
+    resource->enabled = true;
+  } else {
+    MV_ASSERT(resource->enabled);
+    if (resource->type == kIoResourceTypeRam) {
+      MV_ASSERT(resource->mapped_region);
+      auto mm = manager_->machine()->memory_manager();
+      mm->Unmap(&resource->mapped_region);
+    } else {
+      manager_->UnregisterIoHandler(this, resource);
+    }
+    resource->enabled = false;
   }
 }
 
-void Device::Read(const IoResource& ir, uint64_t offset, uint8_t* data, uint32_t size) {
+void Device::Read(const IoResource* resource, uint64_t offset, uint8_t* data, uint32_t size) {
   MV_PANIC("not implemented %s base=0x%lx offset=0x%lx size=%d",
-    name_, ir.base, offset, size);
+    name_, resource->base, offset, size);
 }
 
-void Device::Write(const IoResource& ir, uint64_t offset, uint8_t* data, uint32_t size) {
+void Device::Write(const IoResource* resource, uint64_t offset, uint8_t* data, uint32_t size) {
   MV_PANIC("not implemented %s base=0x%lx offset=0x%lx size=%d data=0x%lx",
-    name_, ir.base, offset, size, *(uint64_t*)data);
+    name_, resource->base, offset, size, *(uint64_t*)data);
+}
+
+bool Device::SaveState(MigrationWriter* writer) {
+  return true;
+}
+
+bool Device::LoadState(MigrationReader* reader) {
+  return true;
 }

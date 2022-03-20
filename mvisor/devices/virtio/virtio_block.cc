@@ -19,7 +19,7 @@
 #include "virtio_pci.h"
 #include <cstring>
 #include <cmath>
-#include "linux/virtio_blk.h"
+#include "linuz/virtio_blk.h"
 #include "logger.h"
 #include "disk_image.h"
 #include "machine.h"
@@ -38,7 +38,8 @@ class VirtioBlock : public VirtioPci {
     pci_header_.device_id = 0x1001;
     pci_header_.subsys_id = 0x0002;
     
-    AddMsiXCapability(1, 2);
+    AddPciBar(1, 0x1000, kIoResourceTypeMmio);
+    AddMsiXCapability(1, 2, 0, 0x1000);
 
     device_features_ |= (1UL << VIRTIO_BLK_F_SEG_MAX) |
       // (1UL << VIRTIO_BLK_F_GEOMETRY) |
@@ -47,7 +48,6 @@ class VirtioBlock : public VirtioPci {
       // (1UL << VIRTIO_BLK_F_TOPOLOGY) |
       (1UL << VIRTIO_BLK_F_WCE) |
       (1UL << VIRTIO_BLK_F_MQ) |
-      // FIXME: DISCARD & WRITE_ZERO needs latest guest drivers
       (1UL << VIRTIO_BLK_F_DISCARD) |
       (1UL << VIRTIO_BLK_F_WRITE_ZEROES);
     bzero(&block_config_, sizeof(block_config_));
@@ -71,7 +71,7 @@ class VirtioBlock : public VirtioPci {
     }
     if (has_key("image")) {
       std::string path = std::get<std::string>(key_values_["image"]);
-      image_ = DiskImage::Create(path, readonly);
+      image_ = DiskImage::Create(this, path, readonly);
     }
     if (image_) {
       InitializeGeometry();
@@ -113,17 +113,44 @@ class VirtioBlock : public VirtioPci {
 
   void OnOutput(int queue_index) {
     auto &vq = queues_[queue_index];
-    VirtElement element;
-  
-    while (PopQueue(vq, element)) {
-      HandleCommand(vq, element);
-      PushQueue(vq, element);
-      NotifyQueue(vq);
+
+    while (auto element = PopQueue(vq)) {
+      HandleCommand(vq, element, [=, &vq]() {
+        PushQueue(vq, element);
+        NotifyQueue(vq);
+      });
     }
   }
 
-  void HandleCommand(VirtQueue& vq, VirtElement& element) {
-    auto &vector = element.vector;
+  void BlockIoAsync(VirtElement* element, size_t position, bool is_write, IoCallback callback) {
+    auto vector(element->vector);
+    for (auto &iov : vector) {
+      void* buffer = iov.iov_base;
+      size_t length = iov.iov_len;
+
+      auto io_complete = [=](auto ret) {
+        if (!is_write && ret != (ssize_t)length) {
+          MV_PANIC("failed IO ret=%lx pos=%lx length=%lx", ret, position, length);
+        }
+        if (!is_write) {
+          element->length += length;
+        }
+        element->vector.pop_back();
+        if (element->vector.empty()) {
+          callback(ret == (ssize_t)length ? VIRTIO_BLK_S_OK : VIRTIO_BLK_S_IOERR);
+        }
+      };
+      if (is_write) {
+        image_->WriteAsync(buffer, position, length, io_complete);
+      } else {
+        image_->ReadAsync(buffer, position, length, io_complete);
+      }
+      position += length;
+    }
+  }
+
+  void HandleCommand(VirtQueue& vq, VirtElement* element, VoidCallback callback) {
+    auto &vector = element->vector;
     /* Read block header */
     virtio_blk_outhdr* request = (virtio_blk_outhdr*)vector.front().iov_base;
     vector.pop_front();
@@ -134,42 +161,31 @@ class VirtioBlock : public VirtioPci {
     vector.pop_back();
 
     /* Set the vring data length to bytes returned */
-    element.length = sizeof(*status);
+    element->length = sizeof(*status);
 
     switch (request->type)
     {
     case VIRTIO_BLK_T_IN: {
       size_t position = request->sector * block_config_.blk_size;
-      for (auto &iov : vector) {
-        void* buffer = iov.iov_base;
-        size_t length = iov.iov_len;
-        ssize_t bytes = image_->Read(buffer, position, length);
-        if (bytes != (ssize_t)length) {
-          MV_PANIC("failed read bytes=%lx pos=%lx length=%lx", bytes, position, length);
-        }
-        position += length;
-        element.length += length;
-      }
-      *status = 0;
+      BlockIoAsync(element, position, false, [callback, status](auto ret) {
+        *status = ret;
+        callback();
+      });
       break;
     }
     case VIRTIO_BLK_T_OUT: {
       size_t position = request->sector * block_config_.blk_size;
-      for (auto &iov : vector) {
-        void* buffer = iov.iov_base;
-        size_t length = iov.iov_len;
-        ssize_t bytes = image_->Write(buffer, position, length);
-        if (bytes <= 0) {
-          break;
-        }
-        position += bytes;
-      }
-      *status = 0;
+      BlockIoAsync(element, position, true, [callback, status](auto ret) {
+        *status = ret;
+        callback();
+      });
       break;
     }
     case VIRTIO_BLK_T_FLUSH:
-      image_->Flush();
-      *status = 0;
+      image_->FlushAsync([callback, status](ssize_t ret) {
+        *status = ret == 0 ? VIRTIO_BLK_S_OK : VIRTIO_BLK_S_IOERR;
+        callback();
+      });
       break;
     case VIRTIO_BLK_T_GET_ID: {
       auto &iov = vector.front();
@@ -177,8 +193,21 @@ class VirtioBlock : public VirtioPci {
       MV_ASSERT(iov.iov_len >= 20);
 
       strcpy((char*)buffer, "virtio-block");
-      element.length += iov.iov_len;
-      *status = 0;
+      element->length += iov.iov_len;
+      *status = VIRTIO_BLK_S_OK;
+      callback();
+      break;
+    }
+    case VIRTIO_BLK_T_DISCARD: {
+      auto &iov = vector.front();
+      auto discard = (virtio_blk_discard_write_zeroes*)iov.iov_base;
+      MV_ASSERT(iov.iov_len == sizeof(*discard));
+      size_t position = discard->sector * block_config_.blk_size;
+      size_t length = discard->num_sectors * block_config_.blk_size;
+      image_->DiscardAsync(position, length, [status, callback, length](auto ret) {
+        *status = ret == (ssize_t)length ? VIRTIO_BLK_S_OK : VIRTIO_BLK_S_IOERR;
+        callback();
+      });
       break;
     }
     default:

@@ -17,13 +17,15 @@
  */
 
 #include "device_manager.h"
-#include <cstring>
+
 #include <algorithm>
+
+#include <cstring>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
-#include <sys/epoll.h>
 #include <signal.h>
+
 #include "logger.h"
 #include "memory_manager.h"
 #include "machine.h"
@@ -39,13 +41,20 @@ class SystemRoot : public Device {
 };
 DECLARE_DEVICE(SystemRoot);
 
+inline IoThread* DeviceManager::io() {
+  return machine_->io_thread_;
+}
 
 DeviceManager::DeviceManager(Machine* machine, Device* root) :
   machine_(machine), root_(root)
 {
-  InitializeIoEvent();
-
   root_->manager_ = this;
+  /* Initialize IRQ chip */
+  SetupIrqChip();
+  
+  /* Initialize GSI routing table */
+  SetupGsiRoutingTable();
+
   /* Call Connect() on all devices and do the initialization
    * 1. reset device status
    * 2. register IO handlers
@@ -57,23 +66,12 @@ DeviceManager::DeviceManager(Machine* machine, Device* root) :
 }
 
 DeviceManager::~DeviceManager() {
-  /* Stop ioevent thread */
-  if (stop_event_fd_ != -1) {
-    uint64_t tmp = 1;
-    write(stop_event_fd_, &tmp, sizeof(tmp));
-  }
-  if (ioevent_thread_.joinable()) {
-    ioevent_thread_.join();
-  }
-
   if (root_) {
     /* Disconnect invoked recursively */
     root_->Disconnect();
   }
-
-  if (epoll_fd_ != -1) {
-    close(epoll_fd_);
-  }
+  
+  safe_close(&vfio_kvm_device_fd_);
 }
 
 /* Called when system start or reset */
@@ -87,25 +85,25 @@ void DeviceManager::ResetDevices() {
 void DeviceManager::PrintDevices() {
   for (auto device : registered_devices_) {
     MV_LOG("Device: %s", device->name());
-    for (auto &ir : device->io_resources()) {
-      switch (ir.type)
+    for (auto resource : device->io_resources()) {
+      switch (resource->type)
       {
       case kIoResourceTypePio:
-        MV_LOG("\tIO port 0x%lx-0x%lx", ir.base, ir.base + ir.length - 1);
+        MV_LOG("\tIO   port    0x%lx-0x%lx %d", resource->base, resource->base + resource->length - 1, resource->enabled);
         break;
       case kIoResourceTypeMmio:
-        MV_LOG("\tMMIO address 0x%016lx-0x016%lx", ir.base, ir.base + ir.length - 1);
+        MV_LOG("\tMMIO address 0x%016lx-0x016%lx %d", resource->base, resource->base + resource->length - 1, resource->enabled);
       case kIoResourceTypeRam:
-        MV_LOG("\tRAM address 0x%016lx-0x016%lx", ir.base, ir.base + ir.length - 1);
+        MV_LOG("\tRAM  address 0x%016lx-0x016%lx %d", resource->base, resource->base + resource->length - 1, resource->enabled);
         break;
       }
     }
   }
 }
 
-Device* DeviceManager::LookupDeviceByName(const std::string name) {
+Device* DeviceManager::LookupDeviceByClass(const std::string class_name) {
   for (auto device : registered_devices_) {
-    if (device->name() == name) {
+    if (device->classname() == class_name) {
       return device;
     }
   }
@@ -115,7 +113,7 @@ Device* DeviceManager::LookupDeviceByName(const std::string name) {
 PciDevice* DeviceManager::LookupPciDevice(uint16_t bus, uint8_t devfn) {
   for (auto device : registered_devices_) {
     PciDevice* pci_device = dynamic_cast<PciDevice*>(device);
-    if (pci_device && pci_device->devfn_ == devfn) {
+    if (pci_device && pci_device->bus_ == bus && pci_device->devfn_ == devfn) {
       return pci_device;
     }
   }
@@ -141,54 +139,108 @@ void DeviceManager::UnregisterDevice(Device* device) {
 }
 
 
-void DeviceManager::RegisterIoHandler(Device* device, const IoResource& io_resource) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
-  if (io_resource.type == kIoResourceTypePio) {
-    pio_handlers_.push_back(new IoHandler {
-      .io_resource = io_resource,
-      .device = device
-    });
-  } else if (io_resource.type == kIoResourceTypeMmio) {
-    // Map the memory to type Device, access these regions will cause MMIO access fault
-    const MemoryRegion* region = machine_->memory_manager()->Map(io_resource.base, io_resource.length,
-      nullptr, kMemoryTypeDevice, io_resource.name);
+void DeviceManager::RegisterVfioGroup(int group_fd) {
+  if (vfio_kvm_device_fd_ == -1) {
+    kvm_create_device create = { .type = KVM_DEV_TYPE_VFIO };
+    if (ioctl(machine_->vm_fd_, KVM_CREATE_DEVICE, &create) < 0) {
+      MV_PANIC("failed to create KVM VFIO device");
+    }
+    vfio_kvm_device_fd_ = create.fd;
+  }
 
-    mmio_handlers_.push_back(new IoHandler {
-      .io_resource = io_resource,
-      .device = device,
-      .memory_region = region
-    });
+  kvm_device_attr attr = {
+    .group = KVM_DEV_VFIO_GROUP,
+    .attr = KVM_DEV_VFIO_GROUP_ADD,
+    .addr = (uint64_t)&group_fd
+  };
+  if (ioctl(vfio_kvm_device_fd_, KVM_SET_DEVICE_ATTR, &attr) < 0) {
+    MV_PANIC("failed to add group %d to KVM VFIO device %d", group_fd, vfio_kvm_device_fd_);
   }
 }
 
-void DeviceManager::UnregisterIoHandler(Device* device, const IoResource& io_resource) {
+void DeviceManager::UnregisterVfioGroup(int group_fd) {
+  MV_ASSERT(vfio_kvm_device_fd_ != -1);
+
+  kvm_device_attr attr = {
+    .group = KVM_DEV_VFIO_GROUP,
+    .attr = KVM_DEV_VFIO_GROUP_DEL,
+    .addr = (uint64_t)&group_fd
+  };
+  if (ioctl(vfio_kvm_device_fd_, KVM_SET_DEVICE_ATTR, &attr) < 0) {
+    MV_PANIC("failed to delete group %d to KVM VFIO device %d", group_fd, vfio_kvm_device_fd_);
+  }
+}
+
+
+void DeviceManager::RegisterIoHandler(Device* device, const IoResource* resource) {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
-  if (io_resource.type == kIoResourceTypePio) {
+  if (resource->type == kIoResourceTypePio) {
+    pio_handlers_.push_back(new IoHandler {
+      .resource = resource,
+      .device = device
+    });
+  } else if (resource->type == kIoResourceTypeMmio) {
+    // Map the memory to type Device. Accessing these regions will cause MMIO access fault
+    const MemoryRegion* region = machine_->memory_manager()->Map(resource->base, resource->length,
+      nullptr, kMemoryTypeDevice, resource->name);
+
+    mmio_handlers_.push_back(new IoHandler {
+      .resource = resource,
+      .device = device,
+      .memory_region = region
+    });
+
+    if (resource->flags & kIoResourceFlagCoalescingMmio) {
+      kvm_coalesced_mmio_zone zone = {
+        .addr = resource->base,
+        .size =  (uint32_t)resource->length
+      };
+      if (ioctl(machine_->vm_fd_, KVM_REGISTER_COALESCED_MMIO, &zone) != 0) {
+        MV_PANIC("failed to register coaleascing MMIO");
+      }
+    }
+  }
+}
+
+void DeviceManager::UnregisterIoHandler(Device* device, const IoResource* resource) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  if (resource->type == kIoResourceTypePio) {
     for (auto it = pio_handlers_.begin(); it != pio_handlers_.end(); it++) {
-      if ((*it)->device == device && (*it)->io_resource.base == io_resource.base) {
+      if ((*it)->device == device && (*it)->resource->base == resource->base) {
         delete *it;
         pio_handlers_.erase(it);
         break;
       }
     }
-  } else if (io_resource.type == kIoResourceTypeMmio) {
+  } else if (resource->type == kIoResourceTypeMmio) {
     for (auto it = mmio_handlers_.begin(); it != mmio_handlers_.end(); it++) {
-      if ((*it)->device == device && (*it)->io_resource.base == io_resource.base) {
+      if ((*it)->device == device && (*it)->resource->base == resource->base) {
         delete *it;
         mmio_handlers_.erase(it);
         break;
       }
     }
+
+    if (resource->flags & kIoResourceFlagCoalescingMmio) {
+      kvm_coalesced_mmio_zone zone = {
+        .addr = resource->base,
+        .size = (uint32_t)resource->length
+      };
+      if (ioctl(machine_->vm_fd_, KVM_UNREGISTER_COALESCED_MMIO, &zone) != 0) {
+        MV_PANIC("failed to unregister coaleascing MMIO");
+      }
+    }
   }
 }
 
-void DeviceManager::RegisterIoEvent(Device* device, IoResourceType type, uint64_t address, uint32_t length, uint64_t datamatch) {
+IoEvent* DeviceManager::RegisterIoEvent(Device* device, IoResourceType type, uint64_t address, uint32_t length, uint64_t datamatch) {
   IoEvent* event = new IoEvent {
+    .type = kIoEventFd,
     .device = device,
     .address = address,
     .length = length,
     .datamatch = datamatch,
-    .flags = KVM_IOEVENTFD_FLAG_DATAMATCH,
+    .flags = length ? KVM_IOEVENTFD_FLAG_DATAMATCH : 0U,
     .fd = eventfd(0, 0)
   };
   if (type == kIoResourceTypePio) {
@@ -209,91 +261,86 @@ void DeviceManager::RegisterIoEvent(Device* device, IoResourceType type, uint64_
     MV_PANIC("failed to register io event, ret=%d", ret);
   }
 
-  struct epoll_event epoll_event = {
-    .events = EPOLLIN,
-    .data = {
-      .ptr = (void*)event
+  io()->StartPolling(event->fd, EPOLLIN, [event, this](int events) {
+    uint64_t tmp;
+    read(event->fd, &tmp, sizeof(tmp));
+    if (event->type == kIoEventMmio) {
+      HandleMmio(event->address, (uint8_t*)&event->datamatch, event->length, true, true);
+    } else if (event->type == kIoEventPio) {
+      HandleIo(event->address, (uint8_t*)&event->datamatch, event->length, true, 1, true);
     }
-  };
-  ret = epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, event->fd, &epoll_event);
-  if (ret < 0) {
-    MV_PANIC("failed to add epoll event, ret=%d", ret);
-  }
+  });
 
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   ioevents_.insert(event);
+  return event;
+}
+
+IoEvent* DeviceManager::RegisterIoEvent(Device* device, IoResourceType type, uint64_t address) {
+  return RegisterIoEvent(device, type, address, 0, 0);
+}
+
+void DeviceManager::UnregisterIoEvent(IoEvent* event) {
+  io()->StopPolling(event->fd);
+
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+  if (event->type == kIoEventMmio || event->type == kIoEventPio) {
+    struct kvm_ioeventfd kvm_ioevent = {
+      .datamatch = event->datamatch,
+      .addr = event->address,
+      .len = event->length,
+      .fd = event->fd,
+      .flags = event->flags | KVM_IOEVENTFD_FLAG_DEASSIGN
+    };
+    int ret = ioctl(machine_->vm_fd_, KVM_IOEVENTFD, &kvm_ioevent);
+    if (ret < 0) {
+      MV_PANIC("failed to unregister io event, ret=%d", ret);
+    }
+  }
+
+  ioevents_.erase(event);
+  safe_close(&event->fd);
+  delete event;
 }
 
 void DeviceManager::UnregisterIoEvent(Device* device, IoResourceType type, uint64_t address) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
-
+  std::unique_lock<std::recursive_mutex> lock(mutex_);
   auto it = std::find_if(ioevents_.begin(), ioevents_.end(), [=](auto &e) {
     return e->device == device && e->address == address &&
       ((type == kIoResourceTypePio) == !!(e->flags & KVM_IOEVENTFD_FLAG_PIO));
   });
-  MV_ASSERT(it != ioevents_.end());
-  IoEvent* event = *it;
-
-  struct kvm_ioeventfd kvm_ioevent = {
-    .datamatch = event->datamatch,
-    .addr = event->address,
-    .len = event->length,
-    .fd = event->fd,
-    .flags = event->flags | KVM_IOEVENTFD_FLAG_DEASSIGN
-  };
-  int ret = ioctl(machine_->vm_fd_, KVM_IOEVENTFD, &kvm_ioevent);
-  if (ret < 0) {
-    MV_PANIC("failed to register io event, ret=%d", ret);
+  if (it == ioevents_.end()) {
+    return;
   }
-
-  ret = epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, event->fd, nullptr);
-  if (ret < 0) {
-    MV_PANIC("failed to add epoll event, ret=%d", ret);
-  }
-
-  ioevents_.erase(event);
+  auto event = *it;
+  lock.unlock();
+  UnregisterIoEvent(event);
 }
 
+void DeviceManager::SetupCoalescingMmioRing(kvm_coalesced_mmio_ring* ring) {
+  if (coalesced_mmio_ring_ == nullptr) {
+    coalesced_mmio_ring_ = ring;
+  }
+}
 
-void DeviceManager::RegisterIoEvent(Device* device, int fd, uint32_t events, EventsCallback callback) {
-  IoEvent* event = new IoEvent {
-    .type = kIoEventFd,
-    .device = device,
-    .fd = fd,
-    .callback = callback
-  };
-  struct epoll_event epoll_event = {
-    .events = events,
-    .data = {
-      .ptr = (void*)event
+/* FIXME: Is mutex necessary? */
+void DeviceManager::FlushCoalescingMmioBuffer() {
+  if (!coalesced_mmio_ring_) {
+    return;
+  }
+  uint max_entries = ((PAGE_SIZE - sizeof(struct kvm_coalesced_mmio_ring)) / \
+    sizeof(struct kvm_coalesced_mmio));
+  while (coalesced_mmio_ring_->first != coalesced_mmio_ring_->last) {
+    struct kvm_coalesced_mmio *m = &coalesced_mmio_ring_->coalesced_mmio[coalesced_mmio_ring_->first];
+    if (m->pio == 1) {
+      machine_->device_manager()->HandleIo(m->phys_addr, m->data, m->len, 1, 1);
+    } else {
+      machine_->device_manager()->HandleMmio(m->phys_addr, m->data, m->len, 1);
     }
-  };
-  int ret = epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, event->fd, &epoll_event);
-  if (ret < 0) {
-    MV_PANIC("failed to add epoll event, fd=%d ret=%d", event->fd, ret);
+    coalesced_mmio_ring_->first = (coalesced_mmio_ring_->first + 1) % max_entries;
   }
-
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
-  ioevents_.insert(event);
 }
-
-void DeviceManager::UnregisterIoEvent(Device* device, int fd) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-  auto it = std::find_if(ioevents_.begin(), ioevents_.end(), [=](auto &e) {
-    return e->device == device && e->fd == fd;
-  });
-  MV_ASSERT(it != ioevents_.end());
-  IoEvent* event = *it;
-
-  int ret = epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, event->fd, nullptr);
-  if (ret < 0) {
-    MV_PANIC("failed to delete epoll event, fd=%d ret=%d", event->fd, ret);
-  }
-
-  ioevents_.erase(event);
-}
-
 
 /* IO ports may overlap like MMIO addresses.
  * Use para-virtual drivers instead of IO operations to improve performance.
@@ -303,10 +350,10 @@ void DeviceManager::HandleIo(uint16_t port, uint8_t* data, uint16_t size, int is
   int it_count = 0;
   std::deque<IoHandler*>::iterator it;
 
-  mutex_.lock();
+  std::unique_lock<std::recursive_mutex> lock(mutex_);
   for (it = pio_handlers_.begin(); it != pio_handlers_.end(); it++, it_count++) {
-    auto &resource = (*it)->io_resource;
-    if (port >= resource.base && port < resource.base + resource.length) {
+    auto resource = (*it)->resource;
+    if (port >= resource->base && port < resource->base + resource->length) {
       Device* device = (*it)->device;
       if (it_count >= 3) {
         // Move to the front for faster access next time
@@ -314,28 +361,41 @@ void DeviceManager::HandleIo(uint16_t port, uint8_t* data, uint16_t size, int is
         pio_handlers_.erase(it);
         --it;
       }
-      mutex_.unlock();
+      lock.unlock();
 
+      auto start_time = std::chrono::steady_clock::now();
       uint8_t* ptr = data;
       for (uint32_t i = 0; i < count; i++) {
         if (is_write) {
-          device->Write(resource, port - resource.base, ptr, size);
+          device->Write(resource, port - resource->base, ptr, size);
         } else {
-          device->Read(resource, port - resource.base, ptr, size);
+          device->Read(resource, port - resource->base, ptr, size);
         }
         ptr += size;
       }
 
-      // if (!ioevents_.empty() && !ioeventfd && is_write) {
-      //   MV_LOG("%s handle slow io %s port: 0x%x size: %x data: %x count: %d", device->name(),
-      //     is_write ? "out" : "in", port, size, *(uint64_t*)data, count);
-      // }
+      if (machine_->debug() && !ioeventfd) {
+        auto cost_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - start_time).count();
+        if (cost_us >= 10000) {
+          MV_LOG("%s SLOW IO %s port=0x%x size=%u data=%lx cost=%.3lfms", device->name(),
+            is_write ? "out" : "in", port, size, *(uint64_t*)data, double(cost_us) / 1000.0);
+        }
+        ++io_accounting_.total_pio;
+        if (start_time - io_accounting_.last_print_time > std::chrono::seconds(1)) {
+          MV_LOG("pio count=%u  mmio count=%u", io_accounting_.total_pio, io_accounting_.total_mmio);
+          io_accounting_.last_print_time = start_time;
+          io_accounting_.total_pio = 0;
+          io_accounting_.total_mmio = 0;
+        }
+        // MV_LOG("%s handle io %s port: 0x%x size: %x data: %016lx count: %d", device->name(),
+        //   is_write ? "out" : "in", port, size, *(uint64_t*)data, count);
+      }
       return;
     }
   }
 
   /* Accessing invalid port always returns error */
-  mutex_.unlock();
   memset(data, 0xFF, size);
   if (machine_->debug()) {
     /* Not allowed unhandled IO for debugging */
@@ -350,14 +410,14 @@ void DeviceManager::HandleIo(uint16_t port, uint8_t* data, uint16_t size, int is
  * a few devices
  * Race condition could happen among multiple vCPUs, should be handled carefully in Read / Write
  */
-void DeviceManager::HandleMmio(uint64_t base, uint8_t* data, uint16_t size, int is_write, bool ioeventfd) {
+void DeviceManager::HandleMmio(uint64_t addr, uint8_t* data, uint16_t size, int is_write, bool ioeventfd) {
   std::deque<IoHandler*>::iterator it;
   int it_count = 0;
 
-  mutex_.lock();
+  std::unique_lock<std::recursive_mutex> lock(mutex_);
   for (it = mmio_handlers_.begin(); it != mmio_handlers_.end(); it++, it_count++) {
-    auto &resource = (*it)->io_resource;
-    if (base >= resource.base && base < resource.base + resource.length) {
+    auto resource = (*it)->resource;
+    if (addr >= resource->base && addr < resource->base + resource->length) {
       Device* device = (*it)->device;
 
       if (it_count >= 3) {
@@ -366,23 +426,40 @@ void DeviceManager::HandleMmio(uint64_t base, uint8_t* data, uint16_t size, int 
         mmio_handlers_.erase(it);
         --it;
       }
-      mutex_.unlock();
+      lock.unlock();
 
+      auto start_time = std::chrono::steady_clock::now();
       if (is_write) {
-        device->Write(resource, base - resource.base, data, size);
+        device->Write(resource, addr - resource->base, data, size);
       } else {
-        device->Read(resource, base - resource.base, data, size);
+        device->Read(resource, addr - resource->base, data, size);
       }
 
-      // if (!ioevents_.empty() && !ioeventfd && is_write) {
-      //   MV_LOG("%s slow mmio %s addr: 0x%x size: %x data: %x", device->name(),
-      //     is_write ? "out" : "in", base, size, *(uint64_t*)data);
-      // }
+      if (machine_->debug() && !ioeventfd) {
+        auto cost_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - start_time).count();
+        if (cost_us >= 10000) {
+          MV_LOG("%s SLOW MMIO %s addr=0x%lx size=%u data=%lx cost=%.3lfms", device->name(),
+            is_write ? "out" : "in", addr, size, *(uint64_t*)data, double(cost_us) / 1000.0);
+        }
+        ++io_accounting_.total_mmio;
+        if (start_time - io_accounting_.last_print_time > std::chrono::seconds(1)) {
+          MV_LOG("pio count=%u  mmio count=%u", io_accounting_.total_pio, io_accounting_.total_mmio);
+          io_accounting_.last_print_time = start_time;
+          io_accounting_.total_pio = 0;
+          io_accounting_.total_mmio = 0;
+        }
+        // MV_LOG("%s handled mmio %s addr: 0x%016lx size: %x data: %016lx", device->name(),
+        //   is_write ? "write" : "read", addr, size, *(uint64_t*)data);
+      }
       return;
     }
   }
-  MV_PANIC("unhandled mmio %s base: 0x%016lx size: %x data: %016lx",
-    is_write ? "write" : "read", base, size, *(uint64_t*)data);
+
+  if (machine_->debug()) {
+    MV_PANIC("unhandled mmio %s base: 0x%016lx size: %x data: %016lx",
+      is_write ? "write" : "read", addr, size, *(uint64_t*)data);
+  }
 }
 
 /* Get the host memory address of a guest physical address */
@@ -404,137 +481,230 @@ void DeviceManager::SetIrq(uint32_t irq, uint32_t level) {
   }
 }
 
+/* It seems we can signal MSI without seting up routing table */
 void DeviceManager::SignalMsi(uint64_t address, uint32_t data) {
   struct kvm_msi msi = {
     .address_lo = (uint32_t)(address),
     .address_hi = (uint32_t)(address >> 32),
     .data = data
   };
-  int ret = ioctl(machine_->vm_fd_, KVM_SIGNAL_MSI, &msi);
+  auto ret = ioctl(machine_->vm_fd_, KVM_SIGNAL_MSI, &msi);
   if (ret != 1) {
     MV_PANIC("KVM_SIGNAL_MSI ret=%d", ret);
   }
 }
 
-void DeviceManager::InitializeIoEvent() {
-  signal(SIGPIPE, SIG_IGN);
-
-  epoll_fd_ = epoll_create(IOEVENTFD_MAX_EVENTS);
-  
-  stop_event_fd_ = eventfd(0, 0);
-  struct epoll_event epoll_event = {
-    .events = EPOLLIN,
-    .data = {
-      .fd = stop_event_fd_
-    }
-  };
-  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, stop_event_fd_, &epoll_event) < 0) {
-    MV_PANIC("failed to add stop event fd");
-  }
-
-  ioevent_thread_ = std::thread(&DeviceManager::IoEventLoop, this);
-}
-
-void DeviceManager::IoEventLoop() {
-  SetThreadName("device-ioevent");
-
-  struct epoll_event events[IOEVENTFD_MAX_EVENTS];
-  uint64_t tmp;
-
-  while (machine_->IsValid()) {
-    int next_timeout_ms = CheckIoTimers();
-    int nfds = epoll_wait(epoll_fd_, events, IOEVENTFD_MAX_EVENTS, next_timeout_ms);
-    if (nfds < 0) {
-      MV_PANIC("nfds = %d", nfds);
-    }
-
-    for (int i = 0; i < nfds; i++) {
-      if (events[i].data.fd == stop_event_fd_) {
-        read(stop_event_fd_, &tmp, sizeof(tmp));
-        break;
-      }
-
-      IoEvent* ioevent = (IoEvent*)events[i].data.ptr;
-      if (ioevent->type == kIoEventPio || ioevent->type == kIoEventMmio) {
-        if (read(ioevent->fd, &tmp, sizeof(tmp)) < 0) {
-          MV_PANIC("failed to read event");
-        }
-      }
-      switch (ioevent->type)
-      {
-      case kIoEventPio:
-        HandleIo(ioevent->address, (uint8_t*)&ioevent->datamatch, ioevent->length, true, 1, true);
-        break;
-      case kIoEventMmio:
-        HandleMmio(ioevent->address, (uint8_t*)&ioevent->datamatch, ioevent->length, true, true);
-        break;
-      case kIoEventFd:
-        ioevent->callback(events[i].events);
-        break;
-      }
-    }
-  }
-}
-
-
-IoTimer* DeviceManager::RegisterIoTimer(Device* device, int interval_ms, bool permanent, VoidCallback callback) {
-  IoTimer* timer = new IoTimer {
-    .device = device,
-    .permanent = permanent,
-    .interval_ms = interval_ms,
-    .callback = callback
-  };
-  timer->next_timepoint = std::chrono::steady_clock::now() + std::chrono::milliseconds(interval_ms);
-
-  {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    iotimers_.insert(timer);
-  }
-
-  /* Wakeup ioevent thread and recalculate the timeout */
-  uint64_t tmp = 1;
-  write(stop_event_fd_, &tmp, sizeof(tm));
-
-  return timer;
-}
-
-void DeviceManager::UnregisterIoTimer(IoTimer* timer) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
-  iotimers_.erase(timer);
-  delete timer;
-}
-
-void DeviceManager::ModifyIoTimer(IoTimer* timer, int interval_ms) {
-  timer->interval_ms = interval_ms;
-  timer->next_timepoint = std::chrono::steady_clock::now() + std::chrono::milliseconds(interval_ms);
-}
-
-int DeviceManager::CheckIoTimers() {
-  auto now = std::chrono::steady_clock::now();
-  int64_t min_timeout_ms = 100000;
-
-  std::vector<IoTimer*> triggered;
+/* Since we cannot read routing table from KVM, we keep a copy and update to KVM if changed */
+void DeviceManager::UpdateGsiRoutingTable() {
+  uint8_t buffer[sizeof(kvm_irq_routing) + sizeof(kvm_irq_routing_entry) * gsi_routing_table_.size()];
+  auto table = (kvm_irq_routing*)buffer;
 
   mutex_.lock();
-  for (auto timer : iotimers_) {
-    auto delta_ms = std::chrono::duration_cast<std::chrono::milliseconds>(timer->next_timepoint - now).count();
-    if (delta_ms <= 1) {
-      triggered.push_back(timer);
-      timer->next_timepoint = now + std::chrono::milliseconds(timer->interval_ms);
-      delta_ms = timer->interval_ms;
-    }
-    if (delta_ms < min_timeout_ms) {
-      min_timeout_ms = delta_ms;
-    }
-  }
+  table->nr = gsi_routing_table_.size();
+  table->flags = 0;
+  std::copy(gsi_routing_table_.begin(), gsi_routing_table_.end(), table->entries);
   mutex_.unlock();
-  
-  for (auto timer : triggered) {
-    timer->callback();
-    if (!timer->permanent) {
-      UnregisterIoTimer(timer);
-      continue;
+
+  auto ret = ioctl(machine_->vm_fd_, KVM_SET_GSI_ROUTING, table);
+  if (ret) {
+    MV_PANIC("KVM_SET_GSI_ROUTING ret=%d", ret);
+  }
+}
+
+/* Use KVM Irq Chip */
+void DeviceManager::SetupIrqChip() {
+  // Use Kvm in-kernel IRQChip
+  if (ioctl(machine_->vm_fd_, KVM_CREATE_IRQCHIP) < 0) {
+    MV_PANIC("failed to create irqchip");
+  }
+
+  // Use Kvm in-kernel PITClock
+  struct kvm_pit_config pit_config = { 0 };
+  if (ioctl(machine_->vm_fd_, KVM_CREATE_PIT2, &pit_config) < 0) {
+    MV_PANIC("failed to create pit");
+  }
+}
+
+/* Although KVM has initialized GSI routing table, we still need to do it again */
+void DeviceManager::SetupGsiRoutingTable() {
+  auto add_irq_routing = [this](uint gsi, uint chip, uint pin) {
+    kvm_irq_routing_entry entry = {
+      .gsi = gsi,
+      .type = KVM_IRQ_ROUTING_IRQCHIP,
+      .u = { .irqchip = { .irqchip = chip, .pin = pin } }
+    };
+    gsi_routing_table_.push_back(entry);
+  };
+
+  /* 8259A Master */
+  for (uint i = 0; i < 8; i++) {
+    if (i != 2) {
+      add_irq_routing(i, 0, i);
     }
   }
-  return min_timeout_ms;
+
+  /* 8259A Slave */
+  for (uint i = 0; i < 8; i++) {
+    add_irq_routing(8 + i, 1, i);
+  }
+
+  /* IOAPIC */
+  for (uint i = 0; i < 24; i++) {
+    if (i == 0) {
+      add_irq_routing(i, 2, 2);
+    } else if (i != 2) {
+      add_irq_routing(i, 2, i);
+    }
+  }
+
+  next_gsi_ = 24;
+  UpdateGsiRoutingTable();
+}
+
+/* This GSI is currently used with IRQ fd */
+int DeviceManager::AddMsiRoute(uint64_t address, uint32_t data, int trigger_fd) {
+  auto gsi = next_gsi_++;
+
+  kvm_irq_routing_entry entry = {
+    .gsi = (uint)gsi,
+    .type = KVM_IRQ_ROUTING_MSI,
+    .u = { .msi = {
+      .address_lo = (uint32_t)address,
+      .address_hi = (uint32_t)(address >> 32),
+      .data = data
+    } }
+  };
+
+  mutex_.lock();
+  gsi_routing_table_.push_back(entry);
+  mutex_.unlock();
+
+  UpdateGsiRoutingTable();
+  if (trigger_fd != -1) {
+    kvm_irqfd irqfd = { .fd = (uint)trigger_fd, .gsi = (uint)gsi };
+    if (ioctl(machine_->vm_fd_, KVM_IRQFD, &irqfd) < 0) {
+      MV_PANIC("failed to assign irqfd=%d to gsi=%d", trigger_fd, gsi);
+    }
+  }
+  return gsi;
+}
+
+/* Setting the address to 0 to remove a MSI route */
+void DeviceManager::UpdateMsiRoute(int gsi, uint64_t address, uint32_t data, int trigger_fd) {
+  std::unique_lock<std::recursive_mutex> lock(mutex_);
+  auto it = std::find_if(gsi_routing_table_.begin(), gsi_routing_table_.end(), [gsi](auto &entry) {
+    return entry.gsi == (uint)gsi;
+  });
+
+  if (it == gsi_routing_table_.end()) {
+    MV_PANIC("not found gsi=%d", gsi);
+  } else if (address == 0) {
+    /* deassign the irqfd and remove from table */
+    if (trigger_fd != -1) {
+      kvm_irqfd irqfd = { .fd = (uint)trigger_fd, .gsi = (uint)gsi, .flags = KVM_IRQFD_FLAG_DEASSIGN };
+      if (ioctl(machine_->vm_fd_, KVM_IRQFD, &irqfd) < 0) {
+        MV_PANIC("failed to assign irqfd=%d to gsi=%d", trigger_fd, gsi);
+      }
+    }
+    gsi_routing_table_.erase(it);
+  } else {
+    /* update entry and irqfd */
+    it->u.msi = (kvm_irq_routing_msi) {
+      .address_lo = (uint32_t)address,
+      .address_hi = (uint32_t)(address >> 32),
+      .data = data
+    };
+    if (trigger_fd != -1) {
+      kvm_irqfd irqfd = { .fd = (uint)trigger_fd, .gsi = (uint)gsi };
+      if (ioctl(machine_->vm_fd_, KVM_IRQFD, &irqfd) < 0) {
+        MV_PANIC("failed to assign irqfd=%d to gsi=%d", trigger_fd, gsi);
+      }
+    }
+  }
+  lock.unlock();
+  
+  UpdateGsiRoutingTable();
+}
+
+
+bool DeviceManager::SaveState(MigrationWriter* writer) {
+  writer->SetPrefix("kvm-irqchip");
+  /* Save irq chip */
+  kvm_irqchip chip;
+  chip.chip_id = KVM_IRQCHIP_PIC_MASTER;
+  MV_ASSERT(ioctl(machine_->vm_fd_, KVM_GET_IRQCHIP, &chip) == 0);
+  writer->WriteRaw("PIC_MASTER", &chip.chip.pic, sizeof(chip.chip.pic));
+
+  chip.chip_id = KVM_IRQCHIP_PIC_SLAVE;
+  MV_ASSERT(ioctl(machine_->vm_fd_, KVM_GET_IRQCHIP, &chip) == 0);
+  writer->WriteRaw("PIC_SLAVE", &chip.chip.pic, sizeof(chip.chip.pic));
+
+  chip.chip_id = KVM_IRQCHIP_IOAPIC;
+  MV_ASSERT(ioctl(machine_->vm_fd_, KVM_GET_IRQCHIP, &chip) == 0);
+  writer->WriteRaw("IOAPIC", &chip.chip.ioapic, sizeof(chip.chip.ioapic));
+
+  kvm_pit_state2 pit2;
+  MV_ASSERT(ioctl(machine_->vm_fd_, KVM_GET_PIT2, &pit2) == 0);
+  writer->WriteRaw("PIT2", &pit2, sizeof(pit2));
+  
+  // writer->SetPrefix("kvm-clock");
+  // kvm_clock_data clock = { 0 };
+  // MV_ASSERT(ioctl(machine_->vm_fd_, KVM_GET_CLOCK, &clock) == 0);
+  // writer->WriteRaw("CLOCK", &clock, sizeof(clock));
+
+  /* Save states of devices */
+  for (auto device : registered_devices_) {
+    writer->SetPrefix(device->name());
+    if (!device->SaveState(writer)) {
+      MV_LOG("failed to save state of device %s", device->name());
+      return false;
+    }
+  }
+  return true;
+}
+
+bool DeviceManager::LoadState(MigrationReader* reader) {
+  reader->SetPrefix("kvm-irqchip");
+  /* Load irq chip */
+  kvm_irqchip chip;
+  chip.chip_id = KVM_IRQCHIP_PIC_MASTER;
+  if (!reader->ReadRaw("PIC_MASTER", &chip.chip.pic, sizeof(chip.chip.pic)))
+    return false;
+  MV_ASSERT(ioctl(machine_->vm_fd_, KVM_SET_IRQCHIP, &chip) == 0);
+
+  chip.chip_id = KVM_IRQCHIP_PIC_SLAVE;
+  if (!reader->ReadRaw("PIC_SLAVE", &chip.chip.pic, sizeof(chip.chip.pic)))
+    return false;
+  MV_ASSERT(ioctl(machine_->vm_fd_, KVM_SET_IRQCHIP, &chip) == 0);
+
+  chip.chip_id = KVM_IRQCHIP_IOAPIC;
+  if (!reader->ReadRaw("IOAPIC", &chip.chip.ioapic, sizeof(chip.chip.ioapic)))
+    return false;
+  MV_ASSERT(ioctl(machine_->vm_fd_, KVM_SET_IRQCHIP, &chip) == 0);
+
+  kvm_pit_state2 pit2;
+  if (!reader->ReadRaw("PIT2", &pit2, sizeof(pit2)))
+    return false;
+  MV_ASSERT(ioctl(machine_->vm_fd_, KVM_SET_PIT2, &pit2) == 0);
+
+  // reader->SetPrefix("kvm-clock");
+  // kvm_clock_data clock = { 0 };
+  // if (!reader->ReadRaw("CLOCK", &clock, sizeof(clock)))
+  //   return false;
+  // MV_ASSERT(ioctl(machine_->vm_fd_, KVM_SET_CLOCK, &clock) == 0);
+
+  /* Reset device states */
+  for (auto device : registered_devices_) {
+    device->Reset();
+  }
+
+  /* Load device states */
+  for (auto device : registered_devices_) {
+    reader->SetPrefix(device->name());
+    if (!device->LoadState(reader)) {
+      MV_PANIC("failed to load state of device %s", device->name());
+      return false;
+    }
+  }
+  return true;
 }

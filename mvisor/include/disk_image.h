@@ -19,10 +19,26 @@
 #ifndef _MVISOR_IMAGE_H
 #define _MVISOR_IMAGE_H
 
+#include <string>
+#include <functional>
+#include <thread>
+#include <mutex>
+#include <deque>
+#include <condition_variable>
+
 #include "utilities.h"
 #include "object.h"
+#include "io_thread.h"
 
-#include <string>
+typedef std::function<void(ssize_t ret)> IoCallback;
+
+enum ImageIoType {
+  kImageIoInformation,
+  kImageIoRead,
+  kImageIoWrite,
+  kImageIoDiscard,
+  kImageIoFlush
+};
 
 struct ImageInformation {
   /* Disk size is block_size * total_blocks */
@@ -30,28 +46,56 @@ struct ImageInformation {
   size_t total_blocks;
 };
 
+class Device;
 class DiskImage : public Object {
  public:
-  static DiskImage* Create(std::string path, bool readonly);
+  static DiskImage* Create(Device* device, std::string path, bool readonly);
 
   DiskImage();
   virtual ~DiskImage();
   virtual void Connect();
-  bool readonly() { return readonly_; }
+
+  bool busy();
+  inline bool readonly() { return readonly_; }
+  inline const std::string& filepath() const { return filepath_; }
+  inline Device* deivce() { return device_; }
 
   /* Always use this static method to create a DiskImage */
 
-  /* Interfaces for a image format to implement */
+  /* Interface for a image format to implement */
   virtual ImageInformation information() = 0;
   virtual ssize_t Read(void *buffer, off_t position, size_t length) = 0;
   virtual ssize_t Write(void *buffer, off_t position, size_t length) = 0;
-  virtual void Flush() = 0;
-  virtual void Trim(off_t position, size_t length) = 0;
+  virtual ssize_t Flush() = 0;
+  /* Optional */
+  virtual ssize_t Discard(off_t position, size_t length);
+
+  /* Interface for user */
+  virtual void ReadAsync(void *buffer, off_t position, size_t length, IoCallback callback);
+  virtual void WriteAsync(void *buffer, off_t position, size_t length, IoCallback callback);
+  virtual void DiscardAsync(off_t position, size_t length, IoCallback callback);
+  virtual void FlushAsync(IoCallback callback);
 
  protected:
-  bool initialized_ = false;
-  bool readonly_ = false;
-  virtual void Initialize(const std::string& path, bool readonly) = 0;
+  bool        initialized_ = false;
+  bool        readonly_ = false;
+  bool        snapshot_ = false;
+  Device*     device_ = nullptr;
+  IoThread*   io_ = nullptr;
+  std::string filepath_;
+
+  virtual void Initialize() = 0;
+  virtual void Finalize();
+
+ private:
+  /* Worker thread to implemente Async IO */
+  std::thread worker_thread_;
+  std::mutex  worker_mutex_;
+  std::condition_variable   worker_cv_;
+  std::deque<VoidCallback>  worker_queue_;
+  bool        finalized_ = false;
+
+  void WorkerProcess();
 };
 
 

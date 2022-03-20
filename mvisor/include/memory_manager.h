@@ -21,6 +21,11 @@
 
 #include <map>
 #include <set>
+#include <vector>
+#include <functional>
+#include <mutex>
+
+#include "migration.h"
 
 enum MemoryType {
   kMemoryTypeReserved = 0,
@@ -29,20 +34,27 @@ enum MemoryType {
 };
 
 struct MemoryRegion {
-  uint64_t gpa;
-  void* host;
-  uint64_t size;
-  uint32_t flags;
-  MemoryType type;
-  char name[20];
+  uint64_t      gpa;
+  void*         host;
+  uint64_t      size;
+  uint32_t      flags;
+  MemoryType    type;
+  char          name[20];
 };
 
-struct KvmSlot {
-  uint64_t begin;
-  uint64_t end;
-  uint32_t slot;
-  uint64_t hva;
+struct MemorySlot {
+  MemoryType    type;
+  uint64_t      begin;
+  uint64_t      end;
+  uint32_t      id;
+  uint64_t      hva;
+  uint32_t      flags;
   MemoryRegion* region;
+};
+
+typedef std::function<void (const MemorySlot* slot, bool unmap)> MemoryListenerCallback;
+struct MemoryListener {
+  MemoryListenerCallback callback;
 };
 
 class Machine;
@@ -53,21 +65,38 @@ class MemoryManager {
 
   const MemoryRegion* Map(uint64_t gpa, uint64_t size, void* host, MemoryType type, const char* name);
   void Unmap(const MemoryRegion** region);
+  void ResetBios();
+
+  /* Used for migration */
+  bool SaveState(MigrationWriter* writer);
+  bool LoadState(MigrationReader* reader);
 
   void PrintMemoryScope();
   void* GuestToHostAddress(uint64_t gpa);
   uint64_t HostToGuestAddress(void* host);
+  std::vector<const MemorySlot*> GetMemoryFlatView();
+  const MemoryListener* RegisterMemoryListener(MemoryListenerCallback callback);
+  void UnregisterMemoryListener(const MemoryListener** plistener);
 
   const std::set<MemoryRegion*>& regions() const { return regions_; }
 
  private:
   void InitializeSystemRam();
+  void LoadBiosFile();
   void AddMemoryRegion(MemoryRegion* region);
+  void UpdateKvmSlot(MemorySlot* slot, bool remove);
 
-  const Machine* machine_;
-  std::set<MemoryRegion*> regions_;
-  std::map<uint64_t, KvmSlot*> kvm_slots_;
-  void* ram_host_;
+  const Machine*                  machine_;
+  void*                           ram_host_;
+  std::set<MemoryRegion*>         regions_;
+  std::map<uint64_t, MemorySlot*> kvm_slots_;
+  std::set<const MemoryListener*> listeners_;
+  std::mutex                      mutex_;
+  
+  /* BIOS data */
+  size_t                          bios_size_;
+  void*                           bios_data_ = nullptr;
+  void*                           bios_backup_ = nullptr;
 };
 
 #endif // _MVISOR_MM_H

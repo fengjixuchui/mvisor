@@ -25,6 +25,8 @@
 #include <string>
 #include <list>
 #include "vcpu.h"
+#include "migration.h"
+
 
 enum IoResourceType {
   kIoResourceTypePio,
@@ -32,11 +34,21 @@ enum IoResourceType {
   kIoResourceTypeRam
 };
 
+enum IoResourceFlag {
+  kIoResourceFlagNone = 0,
+  kIoResourceFlagCoalescingMmio = 1
+};
+
+struct MemoryRegion;
 struct IoResource {
-  IoResourceType type;
-  uint64_t base;
-  uint64_t length;
-  const char* name;
+  IoResourceType      type;
+  uint64_t            base;
+  uint64_t            length;
+  const char*         name;
+  bool                enabled;
+  void*               host_memory;
+  const MemoryRegion* mapped_region;
+  IoResourceFlag      flags;
 };
 
 class DeviceManager;
@@ -47,21 +59,26 @@ class Device : public Object {
 
   virtual void Connect();
   virtual void Disconnect();
-  virtual void Read(const IoResource& ir, uint64_t offset, uint8_t* data, uint32_t size);
-  virtual void Write(const IoResource& ir, uint64_t offset, uint8_t* data, uint32_t size);
+  virtual void Read(const IoResource* resource, uint64_t offset, uint8_t* data, uint32_t size);
+  virtual void Write(const IoResource* resource, uint64_t offset, uint8_t* data, uint32_t size);
   virtual void Reset();
 
-  const std::list<IoResource>& io_resources() const { return io_resources_; }
+  virtual bool SaveState(MigrationWriter* writer);
+  virtual bool LoadState(MigrationReader* reader);
+
+  const std::list<IoResource*>& io_resources() const { return io_resources_; }
   DeviceManager* manager() { return manager_; }
  protected:
   void AddIoResource(IoResourceType type, uint64_t base, uint64_t length, const char* name);
+  void AddIoResource(IoResourceType type, uint64_t base, uint64_t length, const char* name, void* host_memory, IoResourceFlag flags = kIoResourceFlagNone);
   void RemoveIoResource(IoResourceType type, const char* name);
   void RemoveIoResource(IoResourceType type, uint64_t base);
+  void SetIoResourceEnabled(IoResource* resource, bool enabled);
 
   friend class DeviceManager;
   DeviceManager* manager_;
 
-  std::list<IoResource> io_resources_;
+  std::list<IoResource*> io_resources_;
   bool connected_ = false;
 };
 

@@ -17,8 +17,12 @@
  */
 
 #include "uip.h"
+
+#include <cstring>
+
 #include "logger.h"
 #include <arpa/inet.h>
+
 
 struct DhcpMessage {
   uint8_t message_type;
@@ -51,10 +55,11 @@ void DhcpServiceUdpSocket::InitializeService(MacAddress router_mac, uint32_t rou
   FILE* fp = fopen("/etc/resolv.conf", "r");
   if (fp) {
     while (!feof(fp)) {
-      char key[256], val[256];
-      if (fscanf(fp, "%s %s\n", key, val) != 2)
-        continue;
-      if (strncmp("nameserver", key, 10) == 0) {
+      char line[256], key[256], val[256];
+      fgets(line, sizeof(line), fp);
+      if (memcmp(line, "nameserver ", 11) == 0) {
+        if (sscanf(line, "%s %s\n", key, val) != 2)
+          continue;
         struct in_addr addr;
         if (inet_aton(val, &addr)) {
           nameservers_.push_back(ntohl(addr.s_addr));
@@ -65,11 +70,21 @@ void DhcpServiceUdpSocket::InitializeService(MacAddress router_mac, uint32_t rou
   } else {
     MV_LOG("warning: /etc/resolv.conf not found");
   }
+  if (nameservers_.empty()) {
+    MV_PANIC("DNS nameservers not found");
+  }
 }
 
+bool DhcpServiceUdpSocket::active() {
+  // Kill timedout
+  if (time(nullptr) - active_time_ >= REDIRECT_TIMEOUT_SECONDS) {
+    return false;
+  }
+  return true;
+}
 
-void DhcpServiceUdpSocket::OnDataFromGuest(void* data, size_t length) {
-  DhcpMessage* dhcp = (DhcpMessage*)data;
+void DhcpServiceUdpSocket::OnPacketFromGuest(Ipv4Packet* packet) {
+  DhcpMessage* dhcp = (DhcpMessage*)packet->data;
 
   std::string reply;
   if (dhcp->option[2] == 1 && dhcp->option[0] == 53) { // Discover
@@ -77,25 +92,28 @@ void DhcpServiceUdpSocket::OnDataFromGuest(void* data, size_t length) {
   } else if (dhcp->option[2] == 3 && dhcp->option[0] == 53) { // Request
     reply = CreateDhcpResponse(dhcp, 5);
   } else {
-    DumpHex(data, length);
-    MV_PANIC("unknown dhcp packet");
+    DumpHex(dhcp, packet->data_length);
+    MV_LOG("unknown dhcp packet option[0]=%x option[2]=%x", dhcp->option[0], dhcp->option[2]);
     return;
   }
 
   // Build UDP reply message
-  auto packet = AllocatePacket();
-  packet->data_length = reply.size();
-  memcpy(packet->data, reply.data(), packet->data_length);
+  auto reply_packet = AllocatePacket(false);
+  if (reply_packet == nullptr) {
+    return;
+  }
+  reply_packet->data_length = reply.size();
+  memcpy(reply_packet->data, reply.data(), reply_packet->data_length);
 
   // DHCP message uses special IPs
   uint32_t sip = sip_, dip = dip_;
   sip_ = 0xFFFFFFFF;
   dip_ = router_ip_;
-  OnDataFromHost(packet);
+  OnDataFromHost(reply_packet);
   sip_ = sip;
   dip_ = dip;
 
-  FreePacket(packet);
+  active_time_ = time(nullptr);
 }
 
 size_t DhcpServiceUdpSocket::FillDhcpOptions(uint8_t* option, int dhcp_type) {

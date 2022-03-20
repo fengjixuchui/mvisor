@@ -19,36 +19,25 @@
 #include "uip.h"
 #include <arpa/inet.h>
 #include "logger.h"
+#include "device_manager.h"
 
 
-Ipv4Socket::Ipv4Socket(NetworkBackendInterface* backend, ethhdr* eth, iphdr* ip) :
+Ipv4Socket::Ipv4Socket(NetworkBackendInterface* backend, Ipv4Packet* packet) :
   backend_(backend) {
+  auto ip = packet->ip;
   sip_ = ntohl(ip->saddr);
   dip_ = ntohl(ip->daddr);
-  closed_ = false;
   debug_ = false;
   active_time_ = time(nullptr);
+
+  auto device = dynamic_cast<Device*>(backend_->device());
+  io_ = device->manager()->io();
+  debug_ = device->debug();
+  MV_ASSERT(io_);
 }
 
-bool Ipv4Socket::IsActive() {
-  return !closed_;
-}
-
-Ipv4Packet* Ipv4Socket::AllocatePacket() {
-  Ipv4Packet* packet = new Ipv4Packet;
-  packet->buffer = new uint8_t[UIP_MAX_BUFFER_SIZE];
-  packet->eth = (ethhdr*)packet->buffer;
-  packet->ip = (iphdr*)&packet->eth[1];
-  packet->data = (void*)&packet->ip[1];
-  packet->tcp = nullptr;
-  packet->udp = nullptr;
-  packet->data_length = 0;
-  return packet;
-}
-
-void Ipv4Socket::FreePacket(Ipv4Packet* packet) {
-  delete packet->buffer;
-  delete packet;
+Ipv4Packet* Ipv4Socket::AllocatePacket(bool urgent) {
+  return backend_->AllocatePacket(urgent);
 }
 
 uint16_t Ipv4Socket::CalculateChecksum(uint8_t* addr, uint16_t count) {

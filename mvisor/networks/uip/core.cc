@@ -31,6 +31,7 @@
 #include "device.h"
 #include "pci_device.h"
 #include "device_manager.h"
+#include "logger.h"
 
 struct ArpMessage {
   uint16_t    ar_hrd;    /* format of hardware address  */
@@ -56,9 +57,9 @@ class Uip : public Object, public NetworkBackendInterface {
   uint32_t guest_ip_;
   std::list<TcpSocket*> tcp_sockets_;
   std::list<UdpSocket*> udp_sockets_;
-  std::recursive_mutex mutex_;
   IoTimer* timer_ = nullptr;
   Device* real_device_ = nullptr;
+  std::vector<Ipv4Packet*> queued_packets_;
 
  public:
   Uip() {
@@ -66,37 +67,52 @@ class Uip : public Object, public NetworkBackendInterface {
 
   ~Uip() {
     if (timer_) {
-      real_device_->manager()->UnregisterIoTimer(timer_);
+      real_device_->manager()->io()->RemoveTimer(timer_);
     }
   }
 
   /* UIP Router Configuration
    * Router MAC: 5255C0A80001
-   * Router IP: 192.168.0.1
+   * Router IP: 192.168.128.1
    */
   virtual void Initialize(NetworkDeviceInterface* device, MacAddress& mac) {
     device_ = device;
     guest_mac_ = mac;
     memcpy(router_mac_.data, "\x52\x55\xC0\xA8\x00\x01", ETH_ALEN);
 
-    // Assign IP 192.168.1.1 to machine
+    // Assign IP 192.168.128.100 to machine
     // FIXME: should be configurable
-    router_subnet_mask_ = 0xFFFF0000;
-    router_ip_ = 0xC0A80001;
-    guest_ip_ = 0xC0A80101;
+    router_subnet_mask_ = 0xFFFFFF00;
+    router_ip_ = 0xC0A88001;
+    guest_ip_ = 0xC0A88064;
 
     // This function could only be called once
     MV_ASSERT(real_device_ == nullptr);
     real_device_ = dynamic_cast<Device*>(device_);
-    timer_ = real_device_->manager()->RegisterIoTimer(real_device_, 10 * 1000, true, [this](){
+    timer_ = real_device_->manager()->io()->AddTimer(10 * 1000, true, [this](){
       OnTimer();
     });
   }
 
+  virtual void Reset() {
+    for (auto p : queued_packets_) {
+      p->Release();
+    }
+    queued_packets_.clear();
+    
+    for (auto it = udp_sockets_.begin(); it != udp_sockets_.end(); it++) {
+      delete *it;
+    }
+    udp_sockets_.clear();
+    for (auto it = tcp_sockets_.begin(); it != tcp_sockets_.end(); it++) {
+      delete *it;
+    }
+    tcp_sockets_.clear();
+  }
+
   void OnTimer() {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
     for (auto it = tcp_sockets_.begin(); it != tcp_sockets_.end();) {
-      if (!(*it)->IsActive()) {
+      if (!(*it)->active()) {
         delete *it;
         it = tcp_sockets_.erase(it);
       } else {
@@ -104,7 +120,7 @@ class Uip : public Object, public NetworkBackendInterface {
       }
     }
     for (auto it = udp_sockets_.begin(); it != udp_sockets_.end();) {
-      if (!(*it)->IsActive()) {
+      if (!(*it)->active()) {
         delete *it;
         it = udp_sockets_.erase(it);
       } else {
@@ -116,21 +132,69 @@ class Uip : public Object, public NetworkBackendInterface {
     }
   }
 
-  virtual void OnFrameFromGuest(std::deque<struct iovec>& vector) {
-    ParseEthPacket(vector, (struct ethhdr*)vector[0].iov_base);
+  virtual void OnReceiveAvailable() {
+    while (!queued_packets_.empty()) {
+      auto packet = queued_packets_.back();
+      queued_packets_.pop_back();
+      if (!OnPacketFromHost(packet))
+        break;
+    }
   }
 
-  virtual void OnFrameFromHost(uint16_t protocol, void* buffer, size_t size) {
+  virtual void OnFrameFromGuest(std::deque<iovec>& vector) {
+    auto packet = new Ipv4Packet;
+    packet->Release = [packet]() {
+      delete packet;
+    };
+    size_t copied = 0;
+    for (auto &v : vector) {
+      memcpy(packet->buffer + copied, v.iov_base, v.iov_len);
+      copied += v.iov_len;
+    }
+    packet->eth = (ethhdr*)packet->buffer;
+    ParseEthPacket(packet);
+  }
+
+  bool OnFrameFromHost(uint16_t protocol, void* buffer, size_t size) {
     // fill eth headers
     ethhdr* eth = (ethhdr*)buffer;
     eth->h_proto = htons(protocol);
     memcpy(eth->h_dest, guest_mac_.data, sizeof(eth->h_dest));
     memcpy(eth->h_source, router_mac_.data, sizeof(eth->h_source));
-  
-    device_->WriteBuffer(buffer, size);
+    return device_->WriteBuffer(buffer, size);
   }
 
-  void ParseEthPacket(std::deque<struct iovec>& vector, ethhdr* eth) {
+  virtual bool OnPacketFromHost(Ipv4Packet* packet) {
+    size_t packet_length = sizeof(ethhdr) + ntohs(packet->ip->tot_len);
+    if (OnFrameFromHost(ETH_P_IP, packet->buffer, packet_length)) {
+      packet->Release();
+      return true;
+    } else {
+      queued_packets_.push_back(packet);
+      return false;
+    }
+  }
+
+  /* when return nullptr, socket should retry later */
+  virtual Ipv4Packet* AllocatePacket(bool urgent) {
+    if (!urgent && !queued_packets_.empty()) {
+      return nullptr;
+    }
+    Ipv4Packet* packet = new Ipv4Packet;
+    packet->eth = (ethhdr*)packet->buffer;
+    packet->ip = (iphdr*)&packet->eth[1];
+    packet->data = (void*)&packet->ip[1];
+    packet->tcp = nullptr;
+    packet->udp = nullptr;
+    packet->data_length = 0;
+    packet->Release = [packet]() {
+      delete packet;
+    };
+    return packet;
+  }
+
+  void ParseEthPacket(Ipv4Packet* packet) {
+    auto eth = packet->eth;
     if (memcmp(eth->h_dest, router_mac_.data, ETH_ALEN) != 0 &&
       memcmp(eth->h_dest, "\xFF\xFF\xFF\xFF\xFF\xFF", ETH_ALEN) != 0) {
       // ignore packets to other ethernet addresses
@@ -141,10 +205,11 @@ class Uip : public Object, public NetworkBackendInterface {
     switch (protocol)
     {
     case ETH_P_IP:
-      ParseIpPacket(vector, eth, (struct iphdr*)&eth[1]);
+      packet->ip = (struct iphdr*)&eth[1];
+      ParseIpPacket(packet);
       break;
     case ETH_P_ARP:
-      ParseArpPacket(vector, eth, (ArpMessage*)vector[1].iov_base);
+      ParseArpPacket(eth, (ArpMessage*)&eth[1]);
       break;
     case ETH_P_IPV6:
       // ignore IPv6
@@ -160,7 +225,7 @@ class Uip : public Object, public NetworkBackendInterface {
     }
   }
 
-  void ParseArpPacket(std::deque<struct iovec>& vector, ethhdr* eth, ArpMessage* arp) {
+  void ParseArpPacket(ethhdr* eth, ArpMessage* arp) {
     if (ntohs(arp->ar_op) == 1) { // ARP request
       uint32_t dip = ntohl(arp->ar_tip);
       if (dip == router_ip_) {
@@ -183,34 +248,31 @@ class Uip : public Object, public NetworkBackendInterface {
     }
   }
 
-  void ParseIpPacket(std::deque<struct iovec>& vector, ethhdr* eth, iphdr* ip) {
+  void ParseIpPacket(Ipv4Packet* packet) {
+    auto ip = packet->ip;
     switch (ip->protocol)
     {
     case 0x06: { // TCP
-      struct tcphdr* tcp_header = (struct tcphdr*)vector[1].iov_base;
-      ParseTcpPacket(vector, eth, ip, tcp_header);
+      packet->tcp = (struct tcphdr*)((uint8_t*)ip + ip->ihl * 4);
+      ParseTcpPacket(packet);
       break;
     }
     case 0x11: { // UDP
-      struct udphdr* udp_header = (struct udphdr*)vector[1].iov_base;
-      ParseUdpPacket(vector, eth, ip, udp_header);
+      packet->udp = (struct udphdr*)((uint8_t*)ip + ip->ihl * 4);
+      ParseUdpPacket(packet);
       break;
     }
     default:
       if (real_device_->debug()) {
         MV_LOG("==================Not UDP or TCP===================");
-        for (auto &vec : vector) {
-          DumpHex(vec.iov_base, vec.iov_len);
-        }
-        MV_LOG("vector size=%lu", vector.size());
-        MV_PANIC("ip packet protocol=%d", ip->protocol);
+        MV_LOG("ip packet protocol=%d", ip->protocol);
+        DumpHex(ip, ntohs(ip->tot_len));
       }
       break;
     }
   }
 
   TcpSocket* LookupTcpSocket(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
     for (auto socket : tcp_sockets_) {
       if (socket->Equals(sip, dip, sport, dport)) {
         return socket;
@@ -219,34 +281,36 @@ class Uip : public Object, public NetworkBackendInterface {
     return nullptr;
   }
 
-  void ParseTcpPacket(std::deque<struct iovec>& vector, ethhdr* eth, iphdr* ip, tcphdr* tcp) {
+  void ParseTcpPacket(Ipv4Packet* packet) {
+    auto ip = packet->ip;
+    auto tcp = packet->tcp;
     uint32_t sip = ntohl(ip->saddr);
     uint32_t dip = ntohl(ip->daddr);
     uint16_t sport = ntohs(tcp->source);
     uint16_t dport = ntohs(tcp->dest);
     
-    RedirectTcpSocket* socket = nullptr;
-    
-    socket = dynamic_cast<RedirectTcpSocket*>(LookupTcpSocket(sip, dip, sport, dport));
-  
+    auto socket = dynamic_cast<RedirectTcpSocket*>(LookupTcpSocket(sip, dip, sport, dport));
+    if (socket == nullptr) {
+      socket = new RedirectTcpSocket(this, packet);
+      tcp_sockets_.push_back(socket);
+    }
+
     // Guest is trying to start a TCP session
     if (tcp->syn) {
-      if (socket == nullptr) {
-        socket = new RedirectTcpSocket(this, eth, ip, tcp);
-        std::lock_guard<std::recursive_mutex> lock(mutex_);
-        tcp_sockets_.push_back(socket);
-      }
-      return;
-    }
-  
-    if (socket == nullptr) {
-      if (real_device_->debug()) {
-        MV_LOG("failed to lookup TCP %x:%u -> %x:%u syn:%d ack:%d rst:%d fin:%d", sip, sport, dip, dport,
-          tcp->syn, tcp->ack, tcp->rst, tcp->fin);
-      }
+      socket->InitializeRedirect(packet);
       return;
     }
 
+    // If not connected, other packets will reset the connection
+    if (!socket->connected()) {
+      if (real_device_->debug()) {
+        MV_LOG("Reset TCP %x:%u -> %x:%u syn:%d ack:%d rst:%d fin:%d", sip, sport, dip, dport,
+          tcp->syn, tcp->ack, tcp->rst, tcp->fin);
+      }
+      socket->Reset(packet);
+      return;
+    }
+  
     // Guest is closing the TCP
     if (tcp->fin) {
       socket->Shutdown(SHUT_WR);
@@ -258,45 +322,22 @@ class Uip : public Object, public NetworkBackendInterface {
       return;
     }
 
+    // If send window buffer is full, try again when new guest ack comes
     if (!socket->UpdateGuestAck(tcp)) {
       return;
     }
 
-    // If send window buffer is full, try again when new guest ack comes
-    if (socket->IsGuestOverflow()) {
-      socket->OnRemoteDataAvailable();
-    }
-
-    size_t payload_length = ntohs(ip->tot_len) - ip->ihl * 4 - tcp->doff * 4;
-    if (payload_length == 0) {
+    // Send out TCP data to remote host
+    packet->data = (uint8_t*)tcp + tcp->doff * 4;
+    packet->data_offset = 0;
+    packet->data_length = ntohs(ip->tot_len) - ip->ihl * 4 - tcp->doff * 4;
+    if (packet->data_length == 0) {
       return;
     }
-
-    // Send out TCP data to remote host
-    if (vector.size() == 2) {
-      uint8_t* data = (uint8_t*)tcp + tcp->doff * 4;
-      socket->OnDataFromGuest(data, payload_length);
-    } else if (vector.size() == 3) {
-      socket->OnDataFromGuest(vector[2].iov_base, vector[2].iov_len);
-    } else if (vector.size() > 3) {
-      vector.pop_front();
-      vector.pop_front();
-      size_t length = 0;
-      for (auto &iov : vector)
-        length += iov.iov_len;
-      uint8_t* data = new uint8_t[length];
-      uint8_t* ptr = data;
-      for (auto &iov : vector) {
-        memcpy(ptr, iov.iov_base, iov.iov_len);
-        ptr += iov.iov_len;
-      }
-      socket->OnDataFromGuest(data, length);
-      delete[] data;
-    }
+    socket->OnPacketFromGuest(packet);
   }
 
   UdpSocket* LookupUdpSocket(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
     for (auto socket : udp_sockets_) {
       if (socket->Equals(sip, dip, sport, dport)) {
         return socket;
@@ -305,18 +346,20 @@ class Uip : public Object, public NetworkBackendInterface {
     return nullptr;
   }
 
-  void ParseUdpPacket(std::deque<struct iovec>& vector, ethhdr* eth, iphdr* ip, udphdr* udp) {
+  void ParseUdpPacket(Ipv4Packet* packet) {
+    auto ip = packet->ip;
+    auto udp = packet->udp;
     uint32_t sip = ntohl(ip->saddr);
     uint32_t dip = ntohl(ip->daddr);
     uint16_t sport = ntohs(udp->source);
     uint16_t dport = ntohs(udp->dest);
 
-    UdpSocket* socket = LookupUdpSocket(sip, dip, sport, dport);
+    auto socket = LookupUdpSocket(sip, dip, sport, dport);
     if (socket == nullptr) {
       // Check if it's UDP broadcast
       if (dip == 0xFFFFFFFF || (dip & router_subnet_mask_) == (router_ip_ & router_subnet_mask_)) {
         if (dport == 67) {
-          auto dhcp = new DhcpServiceUdpSocket(this, eth, ip, udp);
+          auto dhcp = new DhcpServiceUdpSocket(this, packet);
           dhcp->InitializeService(router_mac_, router_ip_, router_subnet_mask_, guest_ip_);
           socket = dhcp;
         } else {
@@ -326,20 +369,18 @@ class Uip : public Object, public NetworkBackendInterface {
           return;
         }
       } else {
-        socket = new RedirectUdpSocket(this, eth, ip, udp);
+        auto redirect_udp = new RedirectUdpSocket(this, packet);
+        redirect_udp->InitializeRedirect();
+        socket = redirect_udp;
       }
-      std::lock_guard<std::recursive_mutex> lock(mutex_);
       udp_sockets_.push_back(socket);
     }
 
     MV_ASSERT(socket);
-    if (vector.size() == 2) {
-      socket->OnDataFromGuest((void*)&udp[1], ntohs(udp->len));
-    } else if (vector.size() == 3) {
-      socket->OnDataFromGuest(vector[2].iov_base, vector[2].iov_len);
-    } else {
-      MV_PANIC("Invalid vector size = %lu", vector.size());
-    }
+    packet->data = &udp[1];
+    packet->data_offset = 0;
+    packet->data_length = ntohs(udp->len) - sizeof(*udp);
+    socket->OnPacketFromGuest(packet);
   }
 
 };

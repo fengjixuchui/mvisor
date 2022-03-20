@@ -20,8 +20,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <set>
+#include "linuz/virtio_net.h"
 #include "device_interface.h"
-#include "linux/virtio_net.h"
 #include "logger.h"
 
 #define DEFAULT_QUEUE_SIZE 256
@@ -37,10 +37,10 @@ struct RxMode {
 
 class VirtioNetwork : public VirtioPci, public NetworkDeviceInterface {
  private:
-  virtio_net_config net_config_;
-  RxMode            rx_mode_;
-  std::set<MacAddress> mac_table_;
-  NetworkBackendInterface* backend_ = nullptr;
+  virtio_net_config         net_config_;
+  RxMode                    rx_mode_;
+  std::set<MacAddress>      mac_table_;
+  NetworkBackendInterface*  backend_ = nullptr;
 
  public:
   VirtioNetwork() {
@@ -50,7 +50,8 @@ class VirtioNetwork : public VirtioPci, public NetworkDeviceInterface {
     pci_header_.subsys_id = 0x0001;
     
     // FIXME: IRQ interrupts sometimes not work on Windows 10
-    AddMsiXCapability(1, 4);
+    AddPciBar(1, 0x1000, kIoResourceTypeMmio);
+    AddMsiXCapability(1, 4, 0, 0x1000);
     
     device_features_ |=
       (1UL << VIRTIO_NET_F_MAC) |
@@ -117,6 +118,8 @@ class VirtioNetwork : public VirtioPci, public NetworkDeviceInterface {
     AddQueue(DEFAULT_QUEUE_SIZE, std::bind(&VirtioNetwork::OnReceive, this, 0));
     AddQueue(DEFAULT_QUEUE_SIZE, std::bind(&VirtioNetwork::OnTransmit, this, 1));
     AddQueue(DEFAULT_QUEUE_SIZE, std::bind(&VirtioNetwork::OnControl, this, 2));
+
+    backend_->Reset();
   }
 
   void ReadDeviceConfig(uint64_t offset, uint8_t* data, uint32_t size) {
@@ -133,13 +136,15 @@ class VirtioNetwork : public VirtioPci, public NetworkDeviceInterface {
     if (debug_) {
       MV_LOG("OnReceive %d", queue_index);
     }
+    if (backend_) {
+      backend_->OnReceiveAvailable();
+    }
   }
 
   void OnTransmit(int queue_index) {
     auto &vq = queues_[queue_index];
-    VirtElement element;
   
-    while (PopQueue(vq, element)) {
+    while (auto element = PopQueue(vq)) {
       HandleTransmit(vq, element);
       PushQueue(vq, element);
       NotifyQueue(vq);
@@ -148,65 +153,72 @@ class VirtioNetwork : public VirtioPci, public NetworkDeviceInterface {
 
   void OnControl(int queue_index) {
     auto &vq = queues_[queue_index];
-    VirtElement element;
   
-    while (PopQueue(vq, element)) {
+    while (auto element = PopQueue(vq)) {
       HandleControl(vq, element);
       PushQueue(vq, element);
       NotifyQueue(vq);
     }
   }
 
-  virtual void WriteBuffer(void* buffer, size_t size) {
+  virtual bool WriteBuffer(void* buffer, size_t size) {
     VirtQueue& vq = queues_[0];
+    MV_ASSERT(vq.enabled);
+  
     size_t offset = 0;
     while (offset < size) {
-      VirtElement element;
-      if (!PopQueue(vq, element)) {
-        MV_PANIC("network queue is full, increase queue size");
-        break;
+      auto element = PopQueue(vq);
+      if (!element) {
+        if (debug_) {
+          MV_LOG("network queue is full, queue size=%d", vq.size);
+        }
+        return false;
       }
 
       if (offset == 0) {
         /* Prepend virtio net header to the buffer vector, the first buffer length = 0xC */
         virtio_net_hdr_v1 header = { .gso_type = VIRTIO_NET_HDR_GSO_NONE };
-        auto &iov = element.vector[0];
+        auto &iov = element->vector[0];
         MV_ASSERT(iov.iov_len == sizeof(header));
         memcpy(iov.iov_base, &header, sizeof(header));
-        element.length += sizeof(header);
-        element.vector.pop_front();
+        element->length += sizeof(header);
+        element->vector.pop_front();
       }
 
       size_t remain_bytes = size - offset;
-      for (auto &iov : element.vector) {
+      for (auto &iov : element->vector) {
         size_t bytes = iov.iov_len < remain_bytes ? iov.iov_len : remain_bytes;
         memcpy(iov.iov_base, (uint8_t*)buffer + offset, bytes);
         offset += bytes;
         remain_bytes -= bytes;
-        element.length += bytes;
+        element->length += bytes;
       }
 
       PushQueue(vq, element);
-      NotifyQueue(vq);
       MV_ASSERT(offset == size);
     }
+    NotifyQueue(vq);
+    return true;
   }
 
-  void HandleTransmit(VirtQueue& vq, VirtElement& element) {
-    auto &vector = element.vector;
-    MV_ASSERT(vector.size() >= 2);
-    
-    virtio_net_hdr_v1* header = (virtio_net_hdr_v1*)vector.front().iov_base;
-    vector.pop_front();
-
+  void HandleTransmit(VirtQueue& vq, VirtElement* element) {
+    auto &vector = element->vector;
+    MV_ASSERT(vector.size() >= 1);
+    auto &front = vector.front();
+    virtio_net_hdr_v1* header = (virtio_net_hdr_v1*)front.iov_base;
     MV_ASSERT(header->gso_type == VIRTIO_NET_HDR_GSO_NONE);
-    if (backend_) {
-      backend_->OnFrameFromGuest(vector);
+
+    if (front.iov_len == sizeof(*header)) {
+      vector.pop_front();
+    } else {
+      front.iov_base = &header[1];
+      front.iov_len -= sizeof(*header);
     }
+    backend_->OnFrameFromGuest(vector);
   }
 
-  void HandleControl(VirtQueue& vq, VirtElement& element) {
-    auto &vector = element.vector;
+  void HandleControl(VirtQueue& vq, VirtElement* element) {
+    auto &vector = element->vector;
     MV_ASSERT(vector.size() >= 3);
 
     virtio_net_ctrl_hdr* control = (virtio_net_ctrl_hdr*)vector.front().iov_base;
@@ -217,7 +229,7 @@ class VirtioNetwork : public VirtioPci, public NetworkDeviceInterface {
     MV_ASSERT(vector.back().iov_len == 1);
     vector.pop_back();
 
-    element.length = sizeof(*status);
+    element->length = sizeof(*status);
     auto &iov = vector.front();
 
     switch (control->cls)

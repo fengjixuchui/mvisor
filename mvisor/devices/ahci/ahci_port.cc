@@ -43,6 +43,7 @@ static inline int is_native_command_queueing(uint8_t ata_cmd)
 AhciPort::AhciPort(DeviceManager* manager, AhciHost* host, int index)
   : manager_(manager), host_(host), port_index_(index)
 {
+  bzero(&port_control_, sizeof(port_control_));
 }
 
 AhciPort::~AhciPort() {
@@ -53,23 +54,35 @@ void AhciPort::AttachDevice(IdeStorageDevice* device) {
 }
 
 void AhciPort::Reset() {
+  if (drive_->debug()) {
+    MV_LOG("reset, command issue=0x%x", port_control_.command_issue);
+  }
+  port_control_.command_issue = 0;
   port_control_.irq_status = 0;
   port_control_.irq_mask = 0;
   port_control_.sata_control = 0;
   port_control_.command = PORT_CMD_SPIN_UP | PORT_CMD_POWER_ON;
+}
 
+void AhciPort::SoftReset() {
   port_control_.sata_status = 0;
   port_control_.sata_error = 0;
   port_control_.sata_active = 0;
   port_control_.task_flie_data = 0x7F;
   port_control_.signature = 0xFFFFFFFF;
   init_d2h_sent_ = false;
+  busy_slot_ = -1;
 
   if (!drive_) {
     return;
   }
 
   drive_->Reset();
+  if (drive_->type() == kIdeStorageTypeCdrom) {
+    port_control_.signature = ATA_SIGNATURE_CDROM;
+  } else {
+    port_control_.signature = ATA_SIGNATURE_DISK;
+  }
 }
 
 void AhciPort::UpdateInitD2H() {
@@ -79,11 +92,6 @@ void AhciPort::UpdateInitD2H() {
   init_d2h_sent_ = true;
 
   UpdateRegisterD2H();
-  if (drive_->type() == kIdeStorageTypeCdrom) {
-    port_control_.signature = ATA_SIGNATURE_CDROM;
-  } else {
-    port_control_.signature = ATA_SIGNATURE_DISK;
-  }
 }
 
 /* io->vector contains a shadow copy to the PRDT (physical region descriptor table)
@@ -118,8 +126,9 @@ bool AhciPort::HandleCommand(int slot) {
   AhciFisRegH2D* fis = (AhciFisRegH2D*)command_table->command_fis;
 
   if (fis->fis_type != kAhciFisTypeRegH2D) {
-    MV_PANIC("unknown fis type 0x%x", fis->fis_type);
-    return false;
+    MV_LOG("unknown fis type 0x%x", fis->fis_type);
+    /* done handling the command */
+    return true;
   }
 
   if (!fis->is_command) {
@@ -156,27 +165,44 @@ bool AhciPort::HandleCommand(int slot) {
 
   PrepareIoVector(command_table->prdt_entries, command_->prdt_length);
 
-  /* Currently commands are executing synchronized, however, it's easy to do a little work
-   * to implement an async version. 
-   * Set the IDE status register to BUSY, and return immediately.
-   * When data is done, remove BUSY status, then raise an IRQ.
-   */
-  drive_->StartCommand();
-  if (io->nbytes <= 0 || io->dma_status) {
-    UpdateRegisterD2H();
-  } else {
-    UpdateSetupPio();
-  }
+  /* We have only one DMA engine each drive.
+   * when async IO is running by IO thread, we should wait for the slot */
+  drive_->StartCommand([this, io, command_, slot, regs]() {
+    if (io->nbytes <= 0 || io->dma_status) {
+      UpdateRegisterD2H();
+    } else {
+      UpdateSetupPio();
+    }
+    command_->bytes_transferred = io->nbytes;
 
-  command_->bytes_transferred = io->nbytes;
+    if (busy_slot_ != -1) {
+      port_control_.command_issue &= ~(1U << busy_slot_);
+      busy_slot_ = -1;
+      /* Check next command */
+      CheckCommand();
+    }
+  });
+
+  if (regs->status & 0x80) { // BUSY
+    busy_slot_ = slot;
+    return false;
+  }
   return true;
 }
 
 void AhciPort::CheckCommand() {
+  if (busy_slot_ != -1) {
+    return;
+  }
   if ((port_control_.command & PORT_CMD_START) && port_control_.command_issue) {
     for (int slot = 0; (slot < 32) && port_control_.command_issue; slot++) {
-      if ((port_control_.command_issue & (1U << slot)) && HandleCommand(slot)) {
-        port_control_.command_issue &= ~(1U << slot);
+      if (port_control_.command_issue & (1U << slot)) {
+        if (HandleCommand(slot)) {
+          port_control_.command_issue &= ~(1U << slot);
+        } else {
+          /* Stop executing other commands if an async command is running */
+          return;
+        }
       }
     }
   }
@@ -196,6 +222,7 @@ void AhciPort::Read(uint64_t offset, uint32_t* data) {
   } else {
     *data = *((uint32_t*)&port_control_ + reg_index);
   }
+  // MV_LOG("%d:%s read port index=%d ret=0x%x", port_index_, drive_->name(), reg_index, *data);
 }
 
 void AhciPort::CheckEngines() {
@@ -237,6 +264,7 @@ void AhciPort::CheckEngines() {
 void AhciPort::Write(uint64_t offset, uint32_t value) {
   AhciPortReg reg_index = (AhciPortReg)(offset / sizeof(uint32_t));
   MV_ASSERT(reg_index < 32);
+  // MV_LOG("%d:%s write port index=%d value=0x%x", port_index_, drive_->name(), reg_index, value);
 
   switch (reg_index)
   {
@@ -273,14 +301,16 @@ void AhciPort::Write(uint64_t offset, uint32_t value) {
     /* Check FIS RX and CLB engines */
     CheckEngines();
 
-    /* XXX usually the FIS would be pending on the bus here and
-      issuing deferred until the OS enables FIS receival.
-      Instead, we only submit it once - which works in most
-      cases, but is a hack. */
-    if ((port_control_.command & PORT_CMD_FIS_ON) && !init_d2h_sent_) {
-      UpdateInitD2H();
-    }
-    CheckCommand();
+    manager_->io()->Schedule([this](){
+      /* XXX usually the FIS would be pending on the bus here and
+        issuing deferred until the OS enables FIS receival.
+        Instead, we only submit it once - which works in most
+        cases, but is a hack. */
+      if ((port_control_.command & PORT_CMD_FIS_ON) && !init_d2h_sent_) {
+        UpdateInitD2H();
+      }
+      CheckCommand();
+    });
     break;
   case kAhciPortRegTaskFileData:
   case kAhciPortRegSignature:
@@ -290,7 +320,7 @@ void AhciPort::Write(uint64_t offset, uint32_t value) {
   case kAhciPortRegSataControl:
     if (((port_control_.sata_control & AHCI_SCR_SCTL_DET) == 1) &&
         ((value & AHCI_SCR_SCTL_DET) == 0)) {
-      Reset();
+      SoftReset();
     }
     port_control_.sata_control = value;
     break;
@@ -303,7 +333,9 @@ void AhciPort::Write(uint64_t offset, uint32_t value) {
     break;
   case kAhciPortRegCommandIssue:
     port_control_.command_issue |= value;
-    CheckCommand();
+    manager_->io()->Schedule([this](){
+      CheckCommand();
+    });
     break;
   default:
     MV_PANIC("not implemented reg index = %x", reg_index);
@@ -380,3 +412,46 @@ void AhciPort::TrigerIrq(int irqbit) {
   host_->CheckIrq();
 }
 
+void AhciPort::SaveState(AhciHostState_PortState* port_state) {
+  port_state->set_index(port_index_);
+  port_state->set_busy_slot(busy_slot_);
+  port_state->set_init_d2h_sent(init_d2h_sent_);
+  auto regs = port_state->mutable_registers();
+  regs->set_command_list_base0(port_control_.command_list_base0);
+  regs->set_command_list_base1(port_control_.command_list_base1);
+  regs->set_fis_base0(port_control_.fis_base0);
+  regs->set_fis_base1(port_control_.fis_base1);
+  regs->set_irq_status(port_control_.irq_status);
+  regs->set_irq_mask(port_control_.irq_mask);
+  regs->set_command(port_control_.command);
+  regs->set_task_flie_data(port_control_.task_flie_data);
+  regs->set_signature(port_control_.signature);
+  regs->set_sata_status(port_control_.sata_status);
+  regs->set_sata_control(port_control_.sata_control);
+  regs->set_sata_error(port_control_.sata_error);
+  regs->set_sata_active(port_control_.sata_active);
+}
+
+void AhciPort::LoadState(const AhciHostState_PortState* port_state) {
+  port_index_ = port_state->index();
+  busy_slot_ = port_state->busy_slot();
+  init_d2h_sent_ = port_state->init_d2h_sent();
+  auto &regs = port_state->registers();
+  port_control_.command_list_base0 = regs.command_list_base0();
+  port_control_.command_list_base1 = regs.command_list_base1();
+  port_control_.fis_base0 = regs.fis_base0();
+  port_control_.fis_base1 = regs.fis_base1();
+  port_control_.irq_status = regs.irq_status();
+  port_control_.irq_mask = regs.irq_mask();
+  port_control_.command = regs.command();
+  port_control_.task_flie_data = regs.task_flie_data();
+  port_control_.signature = regs.signature();
+  port_control_.sata_status = regs.sata_status();
+  port_control_.sata_control = regs.sata_control();
+  port_control_.sata_error = regs.sata_error();
+  port_control_.sata_active = regs.sata_active();
+
+  /* Setup command_list_ and fis_rx_ pointers */
+  port_control_.command &= ~(PORT_CMD_LIST_ON | PORT_CMD_FIS_ON);
+  CheckEngines();
+}

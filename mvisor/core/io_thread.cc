@@ -18,110 +18,274 @@
 
 
 #include "io_thread.h"
+
 #include <cstring>
+#include <unistd.h>
+#include <sys/eventfd.h>
+#include <arpa/inet.h>
+
+#include <filesystem>
+
 #include "logger.h"
 #include "machine.h"
+#include "disk_image.h"
 
-#define MAX_EVENTS 256
+#define MAX_ENTRIES 256
 
 IoThread::IoThread(Machine* machine) : machine_(machine) {
-  bzero(&context_, sizeof(context_));
+  epoll_fd_ = epoll_create(MAX_ENTRIES);
+  event_fd_ = eventfd(0, 0);
 }
 
 IoThread::~IoThread() {
+  Kick();
+
   if (thread_.joinable()) {
     thread_.join();
   }
+
+  if (event_fd_ > 0) {
+    safe_close(&event_fd_);
+  }
+  if (epoll_fd_ > 0) {
+    safe_close(&epoll_fd_);
+  }
 }
+
 
 void IoThread::Start() {
-  MV_ASSERT(io_setup(MAX_EVENTS, &context_) == 0);
-  thread_ = std::thread(&IoThread::EventLoop, this);
+
+  thread_ = std::thread(&IoThread::RunLoop, this);
+
+  StartPolling(event_fd_, EPOLLIN, [this](auto ret) {
+    uint64_t tmp;
+    read(event_fd_, &tmp, sizeof(tmp));
+  });
 }
 
-void IoThread::EventLoop() {
-  SetThreadName("iothread");
+void IoThread::Stop() {
+  /* Just wakeup the thread and found machine is stopped */
+  MV_ASSERT(!machine_->IsValid());
+  Kick();
+}
 
-  struct timespec timeout = {
-    .tv_sec = 1,
-    .tv_nsec = 0
-  };
-  const long min_nr = 1, max_nr = MAX_EVENTS;
-  struct io_event events[max_nr];
+void IoThread::Kick() {
+  if (event_fd_ > 0) {
+    uint64_t tmp = 1;
+    write(event_fd_, &tmp, sizeof(tmp));
+  }
+}
 
-  while (machine_->IsValid()) {
-    int ret = io_getevents(context_, min_nr, max_nr, events, &timeout);
-    if (ret < 0) {
-      if (ret == -EINTR)
-        continue;
-      MV_PANIC("failed in io_getevents, ret=%d", ret);
+void IoThread::RunLoop() {
+  SetThreadName("mvisor-iothread");
+  signal(SIGPIPE, SIG_IGN);
+
+  struct epoll_event events[MAX_ENTRIES];
+
+  while (true) {
+    /* Execute timer events and calculate the next timeout */
+    int next_timeout_ms = CheckTimers();
+    /* Check paused state before sleep */
+    while(machine_->IsPaused() && CanPauseNow()) {
+      machine_->WaitToResume();
     }
-  
-    if (ret == 0) {
-      /* timeout */
-      continue;
+    if (!machine_->IsValid()) {
+      break;
+    }
+    int nfds = epoll_wait(epoll_fd_, events, MAX_ENTRIES, next_timeout_ms);
+    if (nfds < 0 && errno != EINTR) {
+      MV_PANIC("nfds=%d", nfds);
+      break;
     }
     
-    // ret is the number of events
-    for (int i = 0; i < ret; i++) {
-      auto request = reinterpret_cast<IoRequest*>(events[i].data);
-      request->callback();
-      delete request;
+    for (int i = 0; i < nfds; i++) {
+      auto event = (EpollEvent*)events[i].data.ptr;
+      MV_ASSERT(event);
+      auto start_time = std::chrono::steady_clock::now();
+      event->callback(events[i].events);
+
+      if (machine_->debug()) {
+        auto cost_us = std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - start_time).count();
+        if (cost_us >= 50000) {
+          MV_LOG("%s SLOW fd=%d events=%d cost=%.3lfms", event->callback.target_type().name(),
+            event->fd, events[i].events, double(cost_us) / 1000.0);
+        }
+      }
     }
   }
 
-  /* Cleanup io operations */
-  io_destroy(context_);
+  if (machine_->debug()) MV_LOG("mvisor-iothread ended");
 }
 
-
-const IoRequest* IoThread::QueueIo(IoRequestType type, int fd, void* buffer, size_t bytes,
-  off_t offset, IoCallback callback) {
-
-  IoRequest* r = new IoRequest;
-  if (type == kIoRequestRead) {
-    io_prep_pread(&r->iocb, fd, buffer, bytes, offset);
-  } else {
-    io_prep_pwrite(&r->iocb, fd, buffer, bytes, offset);
+EpollEvent* IoThread::StartPolling(int fd, uint poll_mask, IoCallback callback) {
+  EpollEvent* event = new EpollEvent {
+    .fd = fd, .callback = callback
+  };
+  event->event = {
+    .events = poll_mask,
+    .data = {
+      .ptr = event
+    }
+  };
+  int ret = epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &event->event);
+  if (ret < 0) {
+    MV_PANIC("failed to add epoll event, ret=%d", ret);
   }
-  r->iocb.data = r;
-  r->type = type;
-  r->callback = callback;
 
-  struct iocb* p = &r->iocb;  
-  int ret = io_submit(context_, 1, &p);
-  if (ret != 1) {
-    MV_PANIC("failed to submit io request, ret=%d", ret);
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  if (epoll_events_.find(fd) != epoll_events_.end()) {
+    MV_PANIC("repeated polling fd=%d, mask=0x%x, callback=%s",
+      fd, poll_mask, callback.target_type().name());
   }
-  return r;
+  epoll_events_[fd] = event;
+  return event;
 }
 
+void IoThread::ModifyPolling(int fd, uint poll_mask) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  auto it = epoll_events_.find(fd);
+  MV_ASSERT(it != epoll_events_.end());
 
-const IoRequest* IoThread::QueueIov(IoRequestType type, int fd, const struct iovec* iov, int iov_count,
-  off_t offset, IoCallback callback) {
-
-  IoRequest* r = new IoRequest;
-  if (type == kIoRequestRead) {
-    io_prep_preadv(&r->iocb, fd, iov, iov_count, offset);
-  } else {
-    io_prep_pwritev(&r->iocb, fd, iov, iov_count, offset);
+  auto event = it->second;
+  event->event.events = poll_mask;
+  int ret = epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, event->fd, &event->event);
+  if (ret < 0) {
+    MV_PANIC("failed to modify epoll event, ret=%d", ret);
   }
-  r->iocb.data = r;
-  r->type = type;
-  r->callback = callback;
-
-  struct iocb* p = &r->iocb;  
-  int ret = io_submit(context_, 1, &p);
-  if (ret != 1) {
-    MV_PANIC("failed to submit io request, ret=%d", ret);
-  }
-  return r;
 }
 
-void IoThread::CancelIo(const IoRequest* request) {
-  io_event event;
-  int ret = io_cancel(context_, (struct iocb*)&request->iocb, &event);
-  if (ret != 0) {
-    MV_PANIC("failed to cancel io request, ret=%d", ret);
+void IoThread::StopPolling(int fd) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  auto it = epoll_events_.find(fd);
+  MV_ASSERT(it != epoll_events_.end());
+
+  auto event = it->second;
+  int ret = epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, event->fd, &event->event);
+  if (ret < 0) {
+    MV_PANIC("failed to delete epoll event, ret=%d", ret);
   }
+  epoll_events_.erase(it);
+  delete event;
+}
+
+IoTimer* IoThread::AddTimer(int interval_ms, bool permanent, VoidCallback callback) {
+  IoTimer* timer = new IoTimer {
+    .permanent = permanent,
+    .interval_ms = interval_ms,
+    .callback = callback
+  };
+  timer->next_timepoint = std::chrono::steady_clock::now() + std::chrono::milliseconds(interval_ms);
+
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  timers_.insert(timer);
+
+  /* Wakeup io thread and recalculate the timeout */
+  Kick();
+
+  return timer;
+}
+
+void IoThread::RemoveTimer(IoTimer* timer) {
+  timer->removed = true;
+}
+
+void IoThread::ModifyTimer(IoTimer* timer, int interval_ms) {
+  timer->interval_ms = interval_ms;
+  timer->next_timepoint = std::chrono::steady_clock::now() + std::chrono::milliseconds(interval_ms);
+}
+
+int IoThread::CheckTimers() {
+  auto now = std::chrono::steady_clock::now();
+  int64_t min_timeout_ms = 100000;
+
+  std::vector<IoTimer*> triggered;
+
+  mutex_.lock();
+  for (auto it = timers_.begin(); it != timers_.end();) {
+    auto timer = *it;
+    if (timer->removed) {
+      it = timers_.erase(it);
+      delete timer;
+    } else {
+      auto delta_ms = std::chrono::duration_cast<std::chrono::milliseconds>(timer->next_timepoint - now).count();
+      if (delta_ms <= 0) {
+        triggered.push_back(timer);
+        timer->next_timepoint = now + std::chrono::milliseconds(timer->interval_ms);
+        delta_ms = timer->interval_ms;
+      }
+      if (delta_ms < min_timeout_ms) {
+        min_timeout_ms = delta_ms;
+      }
+      ++it;
+    }
+  }
+  mutex_.unlock();
+  
+  for (auto timer : triggered) {
+    timer->callback();
+    if (!timer->permanent) {
+      timer->removed = true;
+      continue;
+    }
+  }
+  return min_timeout_ms;
+}
+
+void IoThread::Schedule(VoidCallback callback) {
+  AddTimer(0, false, callback);
+}
+
+void IoThread::RegisterDiskImage(DiskImage* image) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  disk_images_.insert(image);
+}
+
+void IoThread::UnregisterDiskImage(DiskImage* image) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  disk_images_.erase(image);
+}
+
+void IoThread::FlushDiskImages() {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+  for (auto image : disk_images_) {
+    image->FlushAsync([](auto ret) {
+    });
+  }
+}
+
+bool IoThread::CanPauseNow() {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+  /* Drain all disk IO */
+  for (auto image : disk_images_) {
+    if (image->busy()) {
+      return false;
+    }
+  }
+
+  /* Drain all IO schedule jobs */
+  for (auto timer : timers_) {
+    if (timer->interval_ms == 0) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/* Make sure call Flush() before save disk images */
+bool IoThread::SaveDiskImage(MigrationWriter* writer) {
+  for (auto image : disk_images_) {
+    auto& device = *image->deivce();
+    writer->SetPrefix(device.name());
+    auto new_path = writer->base_path() + "/" + device.name() + "/disk.qcow2";
+    if (std::filesystem::exists(new_path)) {
+      std::filesystem::remove(new_path);
+    }
+    std::filesystem::copy_file(image->filepath(), new_path);
+    device["image"] = new_path;
+  }
+  return true;
 }

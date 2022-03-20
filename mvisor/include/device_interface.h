@@ -28,14 +28,26 @@
 class KeyboardInputInterface {
  public:
   virtual void QueueKeyboardEvent(uint8_t scancode[10]) = 0;
-  virtual void QueueMouseEvent(uint8_t button_state, int rel_x, int rel_y, int rel_z) = 0;
-  virtual bool CanAcceptInput() = 0;
+  virtual void QueueMouseEvent(uint buttons, int rel_x, int rel_y, int rel_z) = 0;
+  virtual bool InputAcceptable() = 0;
+};
+
+struct PointerEvent {
+  uint buttons; 
+  int x;
+  int y;
+  int z;
+  uint screen_width;
+  uint screen_height;
+};
+class PointerInputInterface {
+ public:
+  virtual void QueuePointerEvent(PointerEvent event) = 0;
+  virtual bool InputAcceptable() = 0;
 };
 
 class SpiceAgentInterface {
  public:
-  virtual void QueuePointerEvent(uint32_t buttons, uint32_t x, uint32_t y) = 0;
-  virtual bool CanAcceptInput() = 0;
   virtual void Resize(uint32_t width, uint32_t height) = 0;
 };
 
@@ -58,7 +70,7 @@ struct DisplayPartialBitmap {
   int         x;
   int         y;
   bool        flip;
-  ReleaseDisplayResourceCallback  release;
+  ReleaseDisplayResourceCallback  Release;
 };
 struct DisplayCursorUpdate {
   CursorUpdateCommand   command;
@@ -80,7 +92,7 @@ struct DisplayCursorUpdate {
       size_t    size;
     } set;
   };
-  ReleaseDisplayResourceCallback release;
+  ReleaseDisplayResourceCallback Release;
 };
 
 typedef std::function <void(void)> DisplayChangeListener;
@@ -108,16 +120,18 @@ class SerialPortInterface {
   virtual void OnMessage(uint8_t* data, size_t size) = 0;
   virtual void OnWritable() = 0;
 
-  virtual void SetReady(bool ready) {
-    ready_ = ready;
-  }
-
   void Initialize(SerialDeviceInterface* device, uint32_t id) {
     device_ = device;
     port_id_ = id;
   }
-  uint32_t port_id() { return port_id_; }
-  const char* port_name() { return port_name_; }
+
+  virtual void set_ready(bool ready) {
+    ready_ = ready;
+  }
+
+  inline uint32_t     port_id() const { return port_id_; }
+  inline const char*  port_name() const { return port_name_; }
+  inline bool         ready() const { return ready_; }
 
  protected:
   SerialDeviceInterface* device_;
@@ -139,14 +153,17 @@ struct MacAddress {
 };
 class NetworkDeviceInterface {
  public:
-  virtual void WriteBuffer(void* buffer, size_t size) = 0;
+  virtual bool WriteBuffer(void* buffer, size_t size) = 0;
 };
-class DeviceManager;
+struct Ipv4Packet;
 class NetworkBackendInterface {
  public:
   virtual void Initialize(NetworkDeviceInterface* device, MacAddress& mac) = 0;
-  virtual void OnFrameFromGuest(std::deque<struct iovec>& vector) = 0;
-  virtual void OnFrameFromHost(uint16_t protocol, void* buffer, size_t size) = 0;
+  virtual void Reset() = 0;
+  virtual void OnFrameFromGuest(std::deque<iovec>& vector) = 0;
+  virtual bool OnPacketFromHost(Ipv4Packet* packet) = 0;
+  virtual Ipv4Packet* AllocatePacket(bool urgent) = 0;
+  virtual void OnReceiveAvailable() = 0;
 
   NetworkDeviceInterface* device() { return device_; }
  protected:

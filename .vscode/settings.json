@@ -59,6 +59,11 @@
         "condition_variable": "cpp",
         "stdint.h": "c",
         "stddef.h": "c",
-        "variant": "cpp"
+        "variant": "cpp",
+        "future": "cpp",
+        "csignal": "cpp",
+        "hash_map": "cpp",
+        "hash_set": "cpp",
+        "iostream": "cpp"
     }
 }

@@ -99,8 +99,9 @@ class IdeStorageDevice : public Device {
   void Reset();
   bool IsAvailable();
 
-  virtual void StartCommand();
+  virtual void StartCommand(VoidCallback iocp);
   virtual void AbortCommand();
+  virtual void CompleteCommand();
 
   IdeStorageType  type() { return type_; }
   IdeIo*          io() { return &io_; }
@@ -120,6 +121,8 @@ class IdeStorageDevice : public Device {
   IdeDriveInfo    drive_info_;
   VoidCallback    ata_handlers_[256];
   bool            write_cache_ = true;
+  VoidCallback    io_complete_;
+  bool            io_async_;
 };
 
 
@@ -127,22 +130,24 @@ class AhciCdrom : public IdeStorageDevice {
  public:
   AhciCdrom();
   virtual void Connect();
+  virtual bool SaveState(MigrationWriter* writer);
+  virtual bool LoadState(MigrationReader* reader);
 
  private:
   void ParseCommandPacket();
   void Atapi_IdentifyData();
   void Atapi_Inquiry();
-  void Atapi_ReadSectors();
+  void Atapi_ReadSectorsAsync();
   void Atapi_TableOfContent();
   void Atapi_ModeSense();
   void Atapi_RequestSense();
-  void SetError(int sense_key, int asc);
+  void SetError(uint sense_key, uint asc);
 
-  int sense_key_;
-  int asc_;
-  size_t total_tracks_;
-  size_t track_size_ = 2048; // Cdrom always use 2048 track size
-  size_t image_block_size_;
+  uint    sense_key_;
+  uint    asc_;
+  size_t  total_tracks_;
+  size_t  track_size_ = 2048; // Cdrom always use 2048 track size
+  size_t  image_block_size_;
 
   VoidCallback atapi_handlers_[256];
 };
@@ -166,8 +171,8 @@ class AhciDisk : public IdeStorageDevice {
   void WriteLba();
   void InitializeGeometry();
   void Ata_IdentifyDevice();
-  void Ata_ReadWriteSectors(bool is_write);
-  void Ata_Trim();
+  void Ata_ReadWriteSectorsAsync(bool is_write);
+  void Ata_TrimAsync();
 
   DiskGeometry geometry_;
   int multiple_sectors_;

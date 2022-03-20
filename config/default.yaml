@@ -5,14 +5,22 @@ machine:
   memory: 8G
   vcpu: 4
   debug: No
+  hypervisor: No
 
 objects:
-  # - class: ahci-cdrom
-  #   image: /data/win10_21h1.iso
+  - class: ahci-cdrom
+    image: /mnt/iso/ubuntu-20.04.1-desktop-amd64.iso
   
   # - class: ahci-disk
   #   image: /data/empty.qcow2
+  #   snapshot: No
 
   - class: virtio-block
-    image: /data/hd.qcow2
-    readonly: No
+    image: /data/win10.qcow2
+    snapshot: Yes
+
+  # - name: nvidia-vgpu
+  #   class: vfio-pci
+  #   parent: pci-host
+  #   debug: Yes
+  #   sysfs: /sys/bus/mdev/devices/c2e088ba-954f-11ec-8584-525400666f2b

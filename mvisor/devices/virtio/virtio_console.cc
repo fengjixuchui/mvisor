@@ -20,10 +20,12 @@
 #include <array>
 #include <functional>
 #include <linux/virtio_console.h>
+
 #include "device_interface.h"
 #include "logger.h"
 #include "device_manager.h"
 #include "virtio_pci.h"
+#include "states/virtio_console.pb.h"
 
 class VirtioConsole : public VirtioPci, public SerialDeviceInterface {
  private:
@@ -32,18 +34,19 @@ class VirtioConsole : public VirtioPci, public SerialDeviceInterface {
 
  public:
   VirtioConsole() {
-    devfn_ = PCI_MAKE_DEVFN(4, 0);
+    devfn_ = PCI_MAKE_DEVFN(5, 0);
     pci_header_.class_code = 0x078000;
     pci_header_.device_id = 0x1003;
     pci_header_.subsys_id = 0x0003;
     
-    AddMsiXCapability(1, 2);
+    AddPciBar(1, 0x1000, kIoResourceTypeMmio);
+    AddMsiXCapability(1, 2, 0, 0x1000);
 
     /* Device specific features */
     device_features_ |= (1UL << VIRTIO_CONSOLE_F_MULTIPORT);
 
     bzero(&console_config_, sizeof(console_config_));
-    console_config_.max_nr_ports = common_config_.num_queues / 2 - 1;
+    console_config_.max_nr_ports = 1;
   }
 
   void Connect() {
@@ -54,6 +57,7 @@ class VirtioConsole : public VirtioPci, public SerialDeviceInterface {
       if (port) {
         port->Initialize(this, console_ports_.size() + 1);
         console_ports_.push_back(port);
+        ++console_config_.max_nr_ports;
       } else {
         MV_PANIC("%s is not a port object", object->name());
       }
@@ -65,6 +69,36 @@ class VirtioConsole : public VirtioPci, public SerialDeviceInterface {
     VirtioPci::Reset();
   
     CreateQueuesForPorts();
+  }
+
+  bool SaveState(MigrationWriter* writer) {
+    VirtioConsoleState state;
+    for (auto console_port : console_ports_) {
+      auto port = state.add_ports();
+      port->set_id(console_port->port_id());
+      port->set_ready(console_port->ready());
+    }
+    writer->WriteProtobuf("VIRTIO_CONSOLE", state);
+    return VirtioPci::SaveState(writer);
+  }
+
+  bool LoadState(MigrationReader* reader) {
+    if (!VirtioPci::LoadState(reader)) {
+      return false;
+    }
+    VirtioConsoleState state;
+    if (!reader->ReadProtobuf("VIRTIO_CONSOLE", state)) {
+      return false;
+    }
+    for (int i = 0; i < state.ports_size(); i++) {
+      auto& port = state.ports(i);
+      for (auto console_port : console_ports_) {
+        if (console_port->port_id() == port.id()) {
+          console_port->set_ready(port.ready());
+        }
+      }
+    }
+    return true;
   }
 
   void CreateQueuesForPorts() {
@@ -93,10 +127,9 @@ class VirtioConsole : public VirtioPci, public SerialDeviceInterface {
   void OnPortOutput(uint32_t id) {
     auto port = FindPortById(id);
     auto &vq = queues_[3 + id * 2];
-    VirtElement element;
   
-    while (PopQueue(vq, element)) {
-      for (auto &iov : element.vector) {
+    while (auto element = PopQueue(vq)) {
+      for (auto &iov : element->vector) {
         port->OnMessage((uint8_t*)iov.iov_base, iov.iov_len);
       }
       PushQueue(vq, element);
@@ -115,10 +148,9 @@ class VirtioConsole : public VirtioPci, public SerialDeviceInterface {
 
   void OnControlOutput() {
     auto &vq = queues_[3];
-    VirtElement element;
   
-    while (PopQueue(vq, element)) {
-      for (auto &iov : element.vector) {
+    while (auto element = PopQueue(vq)) {
+      for (auto &iov : element->vector) {
         virtio_console_control* vcc = (virtio_console_control*)iov.iov_base;
         HandleConsoleControl(vcc);
       }
@@ -130,18 +162,18 @@ class VirtioConsole : public VirtioPci, public SerialDeviceInterface {
   void WriteBuffer(VirtQueue& vq, void* buffer, size_t size) {
     size_t offset = 0;
     while (offset < size) {
-      VirtElement element;
-      if (!PopQueue(vq, element)) {
+      auto element = PopQueue(vq);
+      if (!element) {
         break;
       }
 
       size_t remain_bytes = size - offset;
-      for (auto &iov : element.vector) {
+      for (auto &iov : element->vector) {
         size_t bytes = iov.iov_len < remain_bytes ? iov.iov_len : remain_bytes;
         memcpy(iov.iov_base, (uint8_t*)buffer + offset, bytes);
         offset += bytes;
         remain_bytes -= bytes;
-        element.length += bytes;
+        element->length += bytes;
       }
 
       PushQueue(vq, element);
@@ -181,7 +213,10 @@ class VirtioConsole : public VirtioPci, public SerialDeviceInterface {
 
   void HandleConsoleControl(virtio_console_control* vcc) {
     if (vcc->event == VIRTIO_CONSOLE_DEVICE_READY) {
-      MV_ASSERT(vcc->value == 1); /* 1 means success */
+      if (vcc->value != 1) { /* 1 means success */
+        MV_LOG("failed to initialize virtio console ret=0x%x", vcc->value);
+        return;
+      }
       
       for (auto &port : console_ports_) {
         SendControlEvent(port, VIRTIO_CONSOLE_PORT_ADD, 1);
@@ -189,7 +224,10 @@ class VirtioConsole : public VirtioPci, public SerialDeviceInterface {
       return;
     }
 
-    MV_ASSERT(vcc->id >= 1 && vcc->id <= console_ports_.size());
+    if (vcc->id < 1 || vcc->id > console_ports_.size()) {
+      MV_LOG("invalid vcc id=%d", vcc->id);
+      return;
+    }
     auto port = FindPortById(vcc->id);
     switch (vcc->event)
     {
@@ -200,7 +238,7 @@ class VirtioConsole : public VirtioPci, public SerialDeviceInterface {
       break;
     
     case VIRTIO_CONSOLE_PORT_OPEN:
-      port->SetReady(vcc->value);
+      port->set_ready(vcc->value);
       break;
     default:
       MV_PANIC("port=%d event=%d", vcc->id, vcc->event);

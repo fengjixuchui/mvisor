@@ -24,8 +24,10 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstdint>
+#include <chrono>
 #include <linux/kvm.h>
 #include <sys/prctl.h>
+#include <csignal>
 
 void Log(LogType type, const char* file, int line, const char* function, const char* format, ...)
 {
@@ -35,11 +37,11 @@ void Log(LogType type, const char* file, int line, const char* function, const c
   vsnprintf(message, 512, format, args);
   va_end(args);
 
-  time_t now = time(NULL);
-  struct tm* tm_now;
+  static auto program_start_time = std::chrono::steady_clock::now();
+  auto delta_us = std::chrono::duration_cast<std::chrono::microseconds>(
+    std::chrono::steady_clock::now() - program_start_time).count();
   char timestr[100];
-  tm_now = localtime(&now);
-  strftime(timestr, 100, "%Y-%m-%d %H:%M:%S", tm_now);
+  sprintf(timestr, "%.3lf", double(delta_us) / 1000);
 
   if (type == kLogTypeDebug) {
     printf("[%s] %s:%d %s() %s\n", timestr, file, line, function, message);
@@ -50,6 +52,7 @@ void Log(LogType type, const char* file, int line, const char* function, const c
     if (errno != 0) {
       fprintf(stderr, "errno=%d, %s\n", errno, strerror(errno));
     }
+    std::raise(SIGINT);
     exit(1);
   }
 }
@@ -60,7 +63,7 @@ void SaveToFile(const char* path, void* data, size_t size) {
   fclose(fp);
 }
 
-void DumpHex(void* data, size_t size) {
+void DumpHex(const void* data, size_t size) {
   uint8_t* ptr = (uint8_t*)data;
   printf("%08x  ", 0);
   for (size_t i = 0; i < size;) {

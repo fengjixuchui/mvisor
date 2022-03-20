@@ -45,7 +45,7 @@ AhciDisk::AhciDisk() {
 
   drive_info_.world_wide_name = rand();
   sprintf(drive_info_.serial, "TC%05ld", drive_info_.world_wide_name);
-  sprintf(drive_info_.model, "TENCLASS HARDDISK");
+  sprintf(drive_info_.model, "Tenclass Disk");
   sprintf(drive_info_.version, "1.0");
 
   multiple_sectors_ = 16;
@@ -55,7 +55,7 @@ AhciDisk::AhciDisk() {
       io_.lba_mode = kIdeLbaMode28;
       io_.dma_status = 1;
       ReadLba();
-      Ata_Trim();
+      Ata_TrimAsync();
     } else {
       AbortCommand();
       MV_PANIC("unknown data set management command=0x%x", regs_.feature0);
@@ -89,7 +89,7 @@ AhciDisk::AhciDisk() {
       MV_LOG("read 0x%lx sectors at 0x%lx", io_.lba_count, io_.lba_block);
     }
     MV_ASSERT(io_.lba_count);
-    Ata_ReadWriteSectors(false);
+    Ata_ReadWriteSectorsAsync(false);
   };
 
   ata_handlers_[0xCA] = [=] () { // ATA_CMD_WRITE_DMA
@@ -100,7 +100,7 @@ AhciDisk::AhciDisk() {
       MV_LOG("write 0x%lx sectors at 0x%lx", io_.lba_count, io_.lba_block);
     }
     MV_ASSERT(io_.lba_count);
-    Ata_ReadWriteSectors(true);
+    Ata_ReadWriteSectorsAsync(true);
   };
 
   ata_handlers_[0xE0] = [=] () { // STANDBYNOW1
@@ -108,7 +108,10 @@ AhciDisk::AhciDisk() {
 
   ata_handlers_[0xE7] =          // FLUSH_CACHE
   ata_handlers_[0xEA] = [=] () { // FLUSH_CACHE_EXT
-    image_->Flush();
+    io_async_ = true;
+    image_->FlushAsync([this](ssize_t ret) {
+      CompleteCommand();
+    });
   };
 
   ata_handlers_[0xF5] = [=] () { // SECURITY_FREEZE_LOCK
@@ -198,41 +201,71 @@ void AhciDisk::WriteLba() {
   }
 }
 
-void AhciDisk::Ata_ReadWriteSectors(bool is_write) {
+void AhciDisk::Ata_ReadWriteSectorsAsync(bool is_write) {
+  io_async_ = true;
   size_t vec_index = 0;
   size_t position = io_.lba_block * geometry_.sector_size;
-  size_t remain_bytes = io_.lba_count * geometry_.sector_size;
+  size_t total_bytes = io_.lba_count * geometry_.sector_size;
+  size_t remain_bytes = total_bytes;
   while (remain_bytes > 0 && vec_index < io_.vector.size()) {
-    auto iov = io_.vector[vec_index];
-  
+    auto &iov = io_.vector[vec_index];
     auto length = remain_bytes < iov.iov_len ? remain_bytes : iov.iov_len;
+
+    auto complete_block = [this, total_bytes, length](ssize_t ret) {
+      io_.nbytes += length;
+      if (io_.nbytes == (ssize_t)total_bytes) {
+        WriteLba();
+        CompleteCommand();
+      }
+    };
     if (is_write) {
-      image_->Write(iov.iov_base, position, length);
+      image_->WriteAsync(iov.iov_base, position, length, complete_block);
     } else {
-      image_->Read(iov.iov_base, position, length);
+      image_->ReadAsync(iov.iov_base, position, length, complete_block);
     }
     position += length;
     remain_bytes -= length;
-    io_.nbytes += length;
     ++vec_index;
   }
-  WriteLba();
 }
 
-void AhciDisk::Ata_Trim() {
-  for (auto vec : io_.vector) {
-    for (size_t i = 0; i < vec.iov_len / sizeof(uint64_t); i++) {
-      uint64_t value = ((uint64_t*)vec.iov_base)[i];
+void AhciDisk::Ata_TrimAsync() {
+  io_async_ = true;
+  size_t total_bytes = 0;
+  struct Chunk {
+    size_t position;
+    size_t length;
+  };
+  std::vector<Chunk> chunks;
+  for (auto &iov : io_.vector) {
+    for (size_t i = 0; i < iov.iov_len / sizeof(uint64_t); i++) {
+      uint64_t value = ((uint64_t*)iov.iov_base)[i];
       size_t block = value & 0x0000FFFFFFFFFFFF;
       size_t count = value >> 48;
+      if (count == 0) {
+        continue;
+      }
       if (block + count >= geometry_.total_sectors) {
         AbortCommand();
         return;
       }
-      if (count) {
-        image_->Trim(block * geometry_.sector_size, count * geometry_.sector_size);
-      }
+      size_t length = count * geometry_.sector_size;
+      chunks.push_back(Chunk {
+        .position = block * geometry_.sector_size,
+        .length = length
+      });
+      total_bytes += length;
     }
+  }
+  io_.nbytes = 0;
+  for (auto chunk : chunks) {
+    image_->DiscardAsync(chunk.position, chunk.length, [this, total_bytes, chunk](ssize_t ret) {
+      io_.nbytes += chunk.length;
+      if (io_.nbytes == (ssize_t)total_bytes) {
+        WriteLba();
+        CompleteCommand();
+      }
+    });
   }
 }
 

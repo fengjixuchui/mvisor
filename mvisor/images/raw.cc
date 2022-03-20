@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include "logger.h"
+#include "device_manager.h"
 
 class RawImage : public DiskImage {
  private:
@@ -39,20 +40,18 @@ class RawImage : public DiskImage {
   virtual ~RawImage() {
     if (fd_ != -1) {
       Flush();
-      close(fd_);
+      safe_close(&fd_);
     }
   }
 
-  void Initialize(const std::string& path, bool readonly) {
-    readonly_ = readonly;
-
-    if (readonly) {
-      fd_ = open(path.c_str(), O_RDONLY);
+  void Initialize() {
+    if (readonly_) {
+      fd_ = open(filepath_.c_str(), O_RDONLY);
     } else {
-      fd_ = open(path.c_str(), O_RDWR);
+      fd_ = open(filepath_.c_str(), O_RDWR);
     }
     if (fd_ < 0)
-      MV_PANIC("disk file not found: %s", path.c_str());
+      MV_PANIC("disk file not found: %s", filepath_.c_str());
 
     struct stat st;
     fstat(fd_, &st);
@@ -67,21 +66,17 @@ class RawImage : public DiskImage {
   ssize_t Write(void *buffer, off_t position, size_t length) {
     if (readonly_) {
       return 0;
+    } else {
+      return pwrite(fd_, buffer, length, position);
     }
-    return pwrite(fd_, buffer, length, position);
   }
 
-  void Flush() {
+  ssize_t Flush() {
     if (readonly_) {
-      return;
+      return 0;
+    } else {
+      return fsync(fd_);
     }
-    int ret = fsync(fd_);
-    if (ret < 0) {
-      MV_PANIC("failed to sync disk image, ret=%d", ret);
-    }
-  }
-
-  void Trim(off_t position, size_t length) {
   }
 
 };

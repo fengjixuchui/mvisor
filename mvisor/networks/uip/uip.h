@@ -27,6 +27,7 @@
 #include <linux/udp.h>
 #include <linux/tcp.h>
 #include <ctime>
+#include "io_thread.h"
 
 #define UIP_MAX_BUFFER_SIZE (64*1024 + 16)
 #define UIP_MAX_UDP_PAYLOAD (64*1024 - 20 - 8)
@@ -43,25 +44,30 @@ struct PseudoHeader {
 } __attribute__((packed));
 
 
+class Ipv4Socket;
 struct Ipv4Packet {
-  uint8_t*  buffer;
-  ethhdr*   eth;
-  iphdr*    ip;
-  udphdr*   udp;
-  tcphdr*   tcp;
-  void*     data;
-  size_t    data_length;
+  Ipv4Socket*   socket;
+  uint8_t       buffer[UIP_MAX_BUFFER_SIZE];
+  ethhdr*       eth;
+  iphdr*        ip;
+  udphdr*       udp;
+  tcphdr*       tcp;
+  void*         data;
+  size_t        data_length;
+  size_t        data_offset;
+  VoidCallback  Release;
 };
 
 class Ipv4Socket {
  public:
-  Ipv4Socket(NetworkBackendInterface* backend, ethhdr* eth, iphdr* ip);
+  Ipv4Socket(NetworkBackendInterface* backend, Ipv4Packet* packet);
   virtual ~Ipv4Socket() {}
-  virtual bool IsActive();
+  virtual void OnPacketFromGuest(Ipv4Packet* packet) = 0;
   
+  virtual bool active() = 0;
+
  protected:
-  virtual Ipv4Packet* AllocatePacket();
-  virtual void FreePacket(Ipv4Packet* packet);
+  virtual Ipv4Packet* AllocatePacket(bool urgent);
   uint16_t CalculateChecksum(uint8_t* addr, uint16_t count);
 
   NetworkBackendInterface* backend_;
@@ -70,33 +76,32 @@ class Ipv4Socket {
   bool closed_;
   time_t active_time_;
   bool debug_;
+
+  IoThread*   io_ = nullptr;
 };
 
 
 class TcpSocket : public Ipv4Socket {
  public:
-  TcpSocket(NetworkBackendInterface* backend, ethhdr* eth, iphdr* ip, tcphdr* tcp);
-  bool UpdateGuestAck(tcphdr* tcp);
+  TcpSocket(NetworkBackendInterface* backend, Ipv4Packet* packet);
    
   inline bool Equals(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
     return sip_ == sip && dip_ == dip && sport_ == sport && dport_ == dport;
   }
-  virtual void OnDataFromGuest(void* data, size_t length) = 0;
+  virtual bool UpdateGuestAck(tcphdr* tcp);
 
  protected:
-  virtual Ipv4Packet* AllocatePacket();
+  virtual Ipv4Packet* AllocatePacket(bool urgent);
   uint16_t CalculateTcpChecksum(Ipv4Packet* packet);
   void OnDataFromHost(Ipv4Packet* packet, uint32_t tcp_flags);
   void ParseTcpOptions(tcphdr* tcp);
   void FillTcpOptions(tcphdr* tcp);
+  void SynchronizeTcp(tcphdr* tcp);
 
   uint16_t sport_;
   uint16_t dport_;
   uint32_t window_size_;
   uint32_t guest_acked_;
-  /* Initial sequence number */
-  uint32_t isn_host_;
-  uint32_t isn_guest_;
   uint32_t ack_host_;
   uint32_t seq_host_;
   uint16_t mss_;
@@ -106,15 +111,14 @@ class TcpSocket : public Ipv4Socket {
 
 class UdpSocket : public Ipv4Socket {
  public:
-  UdpSocket(NetworkBackendInterface* backend, ethhdr* eth, iphdr* ip, udphdr* udp);
+  UdpSocket(NetworkBackendInterface* backend, Ipv4Packet* packet);
 
   inline bool Equals(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
     return sip_ == sip && dip_ == dip && sport_ == sport && dport_ == dport;
   }
-  virtual void OnDataFromGuest(void* data, size_t length) = 0;
 
  protected:
-  virtual Ipv4Packet* AllocatePacket();
+  virtual Ipv4Packet* AllocatePacket(bool urgent);
   uint16_t CalculateUdpChecksum(Ipv4Packet* packet);
   void OnDataFromHost(Ipv4Packet* packet);
 
@@ -124,56 +128,67 @@ class UdpSocket : public Ipv4Socket {
 
 class RedirectTcpSocket : public TcpSocket {
  public:
-  RedirectTcpSocket(NetworkBackendInterface* backend, ethhdr* eth, iphdr* ip, tcphdr* tcp);
+  RedirectTcpSocket(NetworkBackendInterface* backend, Ipv4Packet* packet);
   virtual ~RedirectTcpSocket();
   void Shutdown(int how);
-  void OnDataFromGuest(void* data, size_t length);
-  void OnRemoteDataAvailable();
-  bool IsGuestOverflow() { return guest_overflow_; }
-  bool IsConnected() { return connected_; }
-  virtual bool IsActive();
+  void InitializeRedirect(Ipv4Packet* packet);
+  void OnPacketFromGuest(Ipv4Packet* packet);
+  bool UpdateGuestAck(tcphdr* tcp);
+  void Reset(Ipv4Packet* packet);
+
+  bool active();
+  bool connected() { return connected_; }
 
  protected:
-  void InitializeRedirect();
+  void StartReading();
+  void StartWriting();
   void OnRemoteConnected();
 
-  bool write_done_;
-  bool read_done_;
-  int fd_;
-  bool connected_;
-  bool guest_overflow_;
+  bool can_read() { return fd_ != -1 && connected_ && !read_done_ && can_read_; }
+  bool can_write() { return fd_ != -1 && connected_ && !write_done_ && can_write_; }
+
+  bool write_done_ = false;
+  bool read_done_ = false;
+  int  fd_ = -1;
+  bool can_read_ = false;
+  bool can_write_ = false;
+  std::deque<Ipv4Packet*> send_queue_;
+  bool connected_ = false;
 };
 
 class Device;
 class DeviceManager;
 class RedirectUdpSocket : public UdpSocket {
  public:
-  RedirectUdpSocket(NetworkBackendInterface* backend, ethhdr* eth, iphdr* ip, udphdr* udp) :
-    UdpSocket(backend, eth, ip, udp) {
-    InitializeRedirect();
+  RedirectUdpSocket(NetworkBackendInterface* backend, Ipv4Packet* packet) :
+    UdpSocket(backend, packet) {
   }
   virtual ~RedirectUdpSocket();
   void InitializeRedirect();
-  void OnDataFromGuest(void* data, size_t length);
-  void OnRemoteDataAvailable();
-  virtual bool IsActive();
+  void OnPacketFromGuest(Ipv4Packet* packet);
+  bool active();
 
  protected:
+  void StartReading();
+
   int fd_;
+  IoTimer*  wait_timer_ = nullptr;
 };
 
 struct DhcpMessage;
 class DhcpServiceUdpSocket : public UdpSocket {
  public:
-  DhcpServiceUdpSocket(NetworkBackendInterface* backend, ethhdr* eth, iphdr* ip, udphdr* udp) :
-    UdpSocket(backend, eth, ip, udp) {
+  DhcpServiceUdpSocket(NetworkBackendInterface* backend, Ipv4Packet* packet) :
+    UdpSocket(backend, packet) {
   }
   void InitializeService(MacAddress router_mac, uint32_t router_ip, uint32_t subnet_mask, uint32_t guest_ip);
-  void OnDataFromGuest(void* data, size_t length);
+  void OnPacketFromGuest(Ipv4Packet* packet);
+  bool active();
+
+ private:
   std::string CreateDhcpResponse(DhcpMessage* request, int dhcp_type);
   size_t FillDhcpOptions(uint8_t* option, int dhcp_type);
 
- private:
   std::vector<uint32_t> nameservers_;
   MacAddress router_mac_;
   uint32_t subnet_mask_;

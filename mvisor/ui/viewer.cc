@@ -24,8 +24,8 @@
 #include "spice/enums.h"
 
 Viewer::Viewer(Machine* machine) : machine_(machine) {
-  device_manager_ = machine_->device_manager();
   SDL_Init(SDL_INIT_VIDEO);
+  LookupDevices();
 }
 
 Viewer::~Viewer() {
@@ -60,12 +60,12 @@ void Viewer::CreateWindow() {
   uint16_t w, h, bpp;
   display_->GetDisplayMode(&w, &h, &bpp);
   MV_ASSERT(w && h && bpp);
-  width_ = w;
-  height_ = h;
+  pointer_state_.screen_width = width_ = w;
+  pointer_state_.screen_height = height_ = h;
   bpp_ = bpp;
   int x = SDL_WINDOWPOS_UNDEFINED, y = SDL_WINDOWPOS_UNDEFINED;
   window_ = SDL_CreateWindow("MVisor", x, y, width_, height_, SDL_WINDOW_RESIZABLE);
-  renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED);
+  renderer_ = SDL_CreateRenderer(window_, -1, 0);
   MV_ASSERT(renderer_);
   
   switch (bpp_)
@@ -106,11 +106,7 @@ void Viewer::CreateWindow() {
 
 void Viewer::UpdateCaption() {
   char title[100];
-  if (grab_input_) {
-    sprintf(title, "MVisor - Press [ESC] to release mouse");
-  } else {
-    sprintf(title, "MVisor - A mini x86 hypervisor - %dx%dx%d", width_, height_, bpp_);
-  }
+  sprintf(title, "MVisor - A mini x86 hypervisor - %dx%dx%d", width_, height_, bpp_);
   SDL_SetWindowTitle(window_, title);
 }
 
@@ -164,9 +160,7 @@ void Viewer::RenderCursor(const DisplayCursorUpdate* cursor_update) {
       SDL_FreeCursor(cursor_);
       cursor_ = nullptr;
     }
-    if (!grab_input_) {
-      SDL_ShowCursor(SDL_ENABLE);
-    }
+    SDL_ShowCursor(SDL_ENABLE);
     auto set = cursor_update->set;
     uint32_t stride = SPICE_ALIGN(set.width, 8) >> 3;
     if (set.type == SPICE_CURSOR_TYPE_MONO) {
@@ -200,65 +194,74 @@ void Viewer::RenderCursor(const DisplayCursorUpdate* cursor_update) {
   }
 }
 
+/* Only use mutex with dequee, since we don't want to block the IoThread */
 void Viewer::Render() {
-  std::lock_guard<std::mutex> lock(mutex_);
   if (requested_update_window_) {
     requested_update_window_ = false;
     DestroyWindow();
     CreateWindow();
-    for (auto partial : partials_) {
-      partial->release();
-    }
-    partials_.clear();
   }
+
+  std::unique_lock<std::mutex> lock(mutex_);
   bool redraw = false;
   while (!cursor_updates_.empty()) {
     auto cursor_update = cursor_updates_.front();
     cursor_updates_.pop_front();
+    lock.unlock();
     RenderCursor(cursor_update);
-    cursor_update->release();
-    if (grab_input_) {
-      redraw = true;
-    }
+    cursor_update->Release();
+    lock.lock();
   }
   if (screen_texture_ && !partials_.empty()) {
     while (!partials_.empty()) {
       auto partial = partials_.front();
       partials_.pop_front();
-      if (bpp_ == 8) {
-        RenderSurface(partial);
-      } else {
-        RenderPartial(partial);
+      lock.unlock();
+
+      if (partial->x + partial->width <= width_ && partial->y + partial->height <= height_) {
+        if (bpp_ == 8) {
+          RenderSurface(partial);
+        } else {
+          RenderPartial(partial);
+        }
       }
-      partial->release();
+      partial->Release();
+      lock.lock();
     }
     redraw = true;
   }
 
+  lock.unlock();
   if (redraw) {
     SDL_RenderCopy(renderer_, screen_texture_, nullptr, nullptr);
-    if (grab_input_) {
-      SDL_Rect rect = {
-        .x = server_cursor_.x,
-        .y = server_cursor_.y,
-        .w = server_cursor_.width,
-        .h = server_cursor_.height
-      };
-      SDL_RenderCopy(renderer_, server_cursor_.texture, nullptr, &rect);
-    }
     SDL_RenderPresent(renderer_);
   }
 }
 
+
+PointerInputInterface* Viewer::GetActivePointer() {
+  if (machine_->IsPaused())
+    return nullptr;
+  for (auto pointer : pointers_) {
+    if (pointer->InputAcceptable()) {
+      return pointer;
+    }
+  }
+  return nullptr;
+}
+
 void Viewer::LookupDevices() {
-  keyboard_ = dynamic_cast<KeyboardInputInterface*>(machine_->LookupObjectByClass("Keyboard"));
+  keyboard_ = dynamic_cast<KeyboardInputInterface*>(machine_->LookupObjectByClass("Ps2"));
   spice_agent_ = dynamic_cast<SpiceAgentInterface*>(machine_->LookupObjectByClass("SpiceAgent"));
-  display_ = dynamic_cast<DisplayInterface*>(machine_->LookupObjectByClass("Qxl"));
+  display_ = dynamic_cast<DisplayInterface*>(machine_->device_manager()->LookupDeviceByClass("Qxl"));
   if (display_ == nullptr) {
-    display_ = dynamic_cast<DisplayInterface*>(machine_->LookupObjectByClass("Vga"));
+    display_ = dynamic_cast<DisplayInterface*>(machine_->device_manager()->LookupDeviceByClass("Vga"));
+    MV_ASSERT(display_);
+  }
+  for (auto o : machine_->LookupObjects([](auto o) { return dynamic_cast<PointerInputInterface*>(o); })) {
+    pointers_.push_back(dynamic_cast<PointerInputInterface*>(o));
   }
   MV_ASSERT(keyboard_ && display_);
-  MV_ASSERT(spice_agent_);
 
   display_->RegisterDisplayChangeListener([this]() {
     requested_update_window_ = true;
@@ -276,8 +279,7 @@ void Viewer::LookupDevices() {
  * https://wiki.libsdl.org/APIByCategory
  */
 int Viewer::MainLoop() {
-  SetThreadName("viewer");
-  LookupDevices();
+  SetThreadName("mvisor-viewer");
 
   auto frame_interval_us = std::chrono::microseconds(1000000 / 30);
   // Loop until all vcpu exits
@@ -306,20 +308,24 @@ int Viewer::MainLoop() {
 }
 
 void Viewer::HandleEvent(const SDL_Event& event) {
-  std::lock_guard<std::mutex> lock(mutex_);
   uint8_t transcoded[10] = { 0 };
+  /* if we dont check the pointer changes, it would have 1000 pointer events per second */
+  bool should_update_pointer = false;
+
   switch (event.type)
   {
   case SDL_KEYDOWN:
-  case SDL_KEYUP:
-    /* Type ESCAPE to exit mouse grab mode */
-    if (grab_input_ && event.key.keysym.sym == SDLK_ESCAPE) {
-      grab_input_ = false;
-      SDL_SetWindowGrab(window_, SDL_FALSE);
-      SDL_ShowCursor(SDL_ENABLE);
-      UpdateCaption();
-      break;
+    if (event.key.keysym.sym == SDLK_PAUSE) {
+      if (machine_->IsPaused()) {
+        machine_->Resume();
+      } else {
+        machine_->Pause();
+      }
+    } else if (event.key.keysym.sym == SDLK_F2) {
+      machine_->Pause();
+      machine_->Save("/tmp/save");
     }
+  case SDL_KEYUP:
     if (TranslateScancode(event.key.keysym.scancode, event.type == SDL_KEYDOWN, transcoded)) {
       keyboard_->QueueKeyboardEvent(transcoded);
     }
@@ -327,47 +333,38 @@ void Viewer::HandleEvent(const SDL_Event& event) {
   case SDL_MOUSEWHEEL: {
     int x, y;
     SDL_GetMouseState(&x, &y);
-    if (event.wheel.y > 0) {
-      spice_agent_->QueuePointerEvent(mouse_buttons_ | (1 << SPICE_MOUSE_BUTTON_UP), x, y);
-      spice_agent_->QueuePointerEvent(mouse_buttons_, x, y);
-    } else if (event.wheel.y < 0) {
-      spice_agent_->QueuePointerEvent(mouse_buttons_ | (1 << SPICE_MOUSE_BUTTON_DOWN), x, y);
-      spice_agent_->QueuePointerEvent(mouse_buttons_, x, y);
+    auto pointer = GetActivePointer();
+    if (pointer) {
+      pointer_state_.x = x;
+      pointer_state_.y = y;
+      pointer_state_.z = event.wheel.y;
+      pointer->QueuePointerEvent(pointer_state_);
     }
     break;
   }
   case SDL_MOUSEBUTTONDOWN:
-    /* If pointer device is not available, try to grab input and use PS/2 input */
-    if (!grab_input_ && spice_agent_ && !spice_agent_->CanAcceptInput()) {
-      grab_input_ = true;
-      SDL_SetWindowGrab(window_, SDL_TRUE);
-      SDL_ShowCursor(SDL_DISABLE);
-      UpdateCaption();
-    }
-    /* fall through */
   case SDL_MOUSEBUTTONUP:
     if (event.button.state) {
-      mouse_buttons_ |= (1 << event.button.button);
+      pointer_state_.buttons |= (1 << event.button.button);
     } else {
-      mouse_buttons_ &= ~(1 << event.button.button);
+      pointer_state_.buttons &= ~(1 << event.button.button);
     }
+    should_update_pointer = true;
     /* fall through */
-  case SDL_MOUSEMOTION:
-    if (spice_agent_ && spice_agent_->CanAcceptInput()) {
+  case SDL_MOUSEMOTION: {
+    auto pointer = GetActivePointer();
+    if (pointer) {
       int x, y;
       SDL_GetMouseState(&x, &y);
-      spice_agent_->QueuePointerEvent(mouse_buttons_, x, y);
-    } else if (grab_input_) {
-      /* swap the middle button and right button bit of input state */
-      uint8_t ps2_state = ((mouse_buttons_ & 2) >> 1) | (mouse_buttons_ & 4) | ((mouse_buttons_ & 8) >> 2);
-      if (event.type == SDL_MOUSEMOTION) {
-        /* multiply by 2 to prevent host mouse go out of window */
-        keyboard_->QueueMouseEvent(ps2_state, event.motion.xrel * 2, event.motion.yrel * 2, 0);
-      } else {
-        keyboard_->QueueMouseEvent(ps2_state, 0, 0, 0);
+      if (should_update_pointer || pointer_state_.x != x || pointer_state_.y != y) {
+        pointer_state_.x = x;
+        pointer_state_.y = y;
+        pointer_state_.z = 0;
+        pointer->QueuePointerEvent(pointer_state_);
       }
     }
     break;
+  }
   case SDL_WINDOWEVENT:
     switch (event.window.event)
     {
