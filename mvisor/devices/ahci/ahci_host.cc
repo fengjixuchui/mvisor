@@ -73,15 +73,24 @@ AhciHost::~AhciHost() {
 void AhciHost::Connect() {
   PciDevice::Connect();
 
-  num_ports_ = children_.size();
+  num_ports_ = 0;
   /* Add storage devices */
-  for (int i = 0; i < num_ports_; i++) {
+  for (size_t i = 0; i < children_.size(); i++) {
     IdeStorageDevice* device = dynamic_cast<IdeStorageDevice*>(children_[i]);
-    MV_ASSERT(device);
+    num_ports_++;
     if (!ports_[i]) {
       ports_[i] = new AhciPort(manager_, this, i);
     }
     ports_[i]->AttachDevice(device);
+  }
+}
+
+void AhciHost::Disconnect() {
+  for (size_t i = 0; i < ports_.size(); i++) {
+    if (ports_[i]) {
+      delete ports_[i];
+      ports_[i] = nullptr;
+    }
   }
 }
 
@@ -149,7 +158,7 @@ void AhciHost::Write(const IoResource* resource, uint64_t offset, uint8_t* data,
     {
     case kAhciHostRegCapabilities:
     case kAhciHostRegPortsImplemented:
-      /* Why Linux write this register ??? */
+      /* Why Linux writes these registers ??? */
       break;
     case kAhciHostRegControl:
       if (value & HOST_CONTROL_RESET) {

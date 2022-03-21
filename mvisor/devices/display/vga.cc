@@ -103,6 +103,8 @@ bool Vga::SaveState(MigrationWriter* writer) {
   state.set_pallete_read_index(vga_.pallete_read_index);
   state.set_pallete_write_index(vga_.pallete_write_index);
   state.set_pallete(vga_.pallete, sizeof(vga_.pallete));
+  state.set_dac_state(vga_.dac_state);
+  state.set_feature_control(vga_.feature_control_);
   writer->WriteProtobuf("VGA", state);
 
   VbeState vbe_state;
@@ -138,6 +140,8 @@ bool Vga::LoadState(MigrationReader* reader) {
   vga_.pallete_read_index = state.pallete_read_index();
   vga_.pallete_write_index = state.pallete_write_index();
   memcpy(vga_.pallete, state.pallete().data(), sizeof(vga_.pallete));
+  vga_.dac_state = state.dac_state();
+  vga_.feature_control_ = state.feature_control();
 
   VbeState vbe_state;
   if (!reader->ReadProtobuf("VBE", vbe_state)) {
@@ -276,12 +280,9 @@ void Vga::VbeWritePort(uint64_t port, uint16_t value) {
       if (value & 1) {
         UpdateDisplayMode();
       }
-      UpdateVRamMemoryMap();
-      break;
-    case VBE_DISPI_INDEX_BANK:
-      UpdateVRamMemoryMap();
       break;
     }
+    UpdateVRamMemoryMap();
   }
 }
 
@@ -304,10 +305,23 @@ void Vga::VgaReadPort(uint64_t port, uint8_t* data, uint32_t size) {
     MV_ASSERT(size == 1);
     *data = vga_.sequence[vga_.sequence_index];
     break;
+  case 0x3C6: 
+    *data = 0xFF;
+    break;
+  case 0x3C7:
+    *data = vga_.dac_state;
+    break;
+  case 0x3C8:
+    *data = vga_.pallete_write_index;
+    break;
   case 0x3C9:
     for (uint32_t i = 0; i < size; i++) {
       *data++ = vga_.pallete[vga_.pallete_read_index++];
     }
+    break;
+  case 0x3CA:
+    MV_ASSERT(size == 1);
+    *data = vga_.feature_control_;
     break;
   case 0x3CC:
     MV_ASSERT(size == 1);
@@ -320,6 +334,10 @@ void Vga::VgaReadPort(uint64_t port, uint8_t* data, uint32_t size) {
   case 0x3CF:
     MV_ASSERT(size == 1);
     *data = vga_.gfx[vga_.gfx_index];
+    break;
+  case 0x3D4:
+    MV_ASSERT(size == 1);
+    *data = vga_.crtc_index;
     break;
   case 0x3D5:
     MV_ASSERT(size == 1);
@@ -378,10 +396,12 @@ void Vga::VgaWritePort(uint64_t port, uint8_t* data, uint32_t size) {
   case 0x3C7:
     MV_ASSERT(size == 1);
     vga_.pallete_read_index = value * 3;
+    vga_.dac_state = 3;
     break;
   case 0x3C8:
     MV_ASSERT(size == 1);
     vga_.pallete_write_index = value * 3;
+    vga_.dac_state = 0;
     break;
   case 0x3C9:
     MV_ASSERT(size == 1);
@@ -422,11 +442,16 @@ void Vga::VgaWritePort(uint64_t port, uint8_t* data, uint32_t size) {
 
 void Vga::UpdateVRamMemoryMap() {
   if (mode_ == kDisplayVbeMode) {
-    vram_map_select_ = vram_base_;
+    auto bpp = vbe_.registers[VBE_DISPI_INDEX_BPP];
+    uint stride = vbe_.registers[VBE_DISPI_INDEX_VIRT_WIDTH] * bpp / 8;
+    uint offset = vbe_.registers[VBE_DISPI_INDEX_X_OFFSET] * bpp / 8;
+    offset += vbe_.registers[VBE_DISPI_INDEX_Y_OFFSET] * stride;
+  
+    vram_map_select_ = vram_base_ + offset;
     vram_map_select_size_ = vram_size_;
     vram_read_select_ = vram_base_ + (vbe_.registers[VBE_DISPI_INDEX_BANK] << 16);
     if (debug_) {
-      MV_LOG("VBE map offset=0x%lx", (vbe_.registers[VBE_DISPI_INDEX_BANK] << 16));
+      MV_LOG("VBE map offset=0x%lx, bank offset=0x%lx", offset, (vbe_.registers[VBE_DISPI_INDEX_BANK] << 16));
     }
   } else if (mode_ == kDisplayVgaMode || mode_ == kDisplayTextMode) {
     const int map_types[][2] = {

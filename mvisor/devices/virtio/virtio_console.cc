@@ -155,8 +155,8 @@ class VirtioConsole : public VirtioPci, public SerialDeviceInterface {
         HandleConsoleControl(vcc);
       }
       PushQueue(vq, element);
-      NotifyQueue(vq);
     }
+    NotifyQueue(vq);
   }
 
   void WriteBuffer(VirtQueue& vq, void* buffer, size_t size) {
