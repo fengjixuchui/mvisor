@@ -23,7 +23,7 @@
 #include <set>
 #include <vector>
 #include <functional>
-#include <mutex>
+#include <shared_mutex>
 
 #include "migration.h"
 
@@ -85,13 +85,15 @@ class MemoryManager {
   void LoadBiosFile();
   void AddMemoryRegion(MemoryRegion* region);
   void UpdateKvmSlot(MemorySlot* slot, bool remove);
+  uint AllocateSlotId();
 
   const Machine*                  machine_;
   void*                           ram_host_;
   std::set<MemoryRegion*>         regions_;
   std::map<uint64_t, MemorySlot*> kvm_slots_;
   std::set<const MemoryListener*> listeners_;
-  std::mutex                      mutex_;
+  std::set<uint>                  free_slots_;
+  mutable std::shared_mutex       mutex_;
   
   /* BIOS data */
   size_t                          bios_size_;

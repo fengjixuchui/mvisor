@@ -61,12 +61,13 @@ class Viewer {
   void RenderCursor(const DisplayCursorUpdate* cursor_update);
   void HandleEvent(const SDL_Event& event);
   PointerInputInterface* GetActivePointer();
+  void SendPointerEvent();
 
   Machine* machine_;
   DisplayInterface* display_;
   KeyboardInputInterface* keyboard_;
-  SpiceAgentInterface* spice_agent_;
   std::vector<PointerInputInterface*> pointers_;
+  std::vector<DisplayResizeInterface*> resizers_;
 
   SDL_Window* window_ = nullptr;
   SDL_Renderer* renderer_ = nullptr;

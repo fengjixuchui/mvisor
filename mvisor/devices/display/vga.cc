@@ -55,12 +55,11 @@ Vga::Vga() {
   pci_header_.subsys_vendor_id = 0x1AF4;
   pci_header_.subsys_id = 0x1100;
   pci_header_.command = PCI_COMMAND_IO | PCI_COMMAND_MEMORY;
-  pci_header_.irq_pin = 1;
   
 
-  /* Bar 0: 256MB VRAM (default total) */
+  /* Bar 0: 64MB VRAM */
   vga_mem_size_ = _MB(16);
-  vram_size_ = _MB(256);
+  vram_size_ = _MB(64);
 
   AddPciBar(0, vram_size_, kIoResourceTypeRam);    /* vgamem */
   /* FIXME: bar 2 should be implemented for stdvga if Qxl is not enabled??? */
@@ -81,7 +80,7 @@ void Vga::Reset() {
 
   vram_map_select_ = vram_base_;
   vram_read_select_ = vram_base_;
-  mode_ = kDisplayTextMode;
+  mode_ = kDisplayUnknownMode;
   width_ = 640;
   height_ = 400;
   bpp_ = 8;
@@ -244,7 +243,7 @@ void Vga::VbeReadPort(uint64_t port, uint16_t* data) {
     if (vbe_.registers[VBE_DISPI_INDEX_ENABLE] & VBE_DISPI_GETCAPS) {
       /* VBE initialization will enable and get capabilities and then disable */
       const uint16_t max_values[] = {
-        0, VBE_DISPI_MAX_XRES, VBE_DISPI_INDEX_YRES, VBE_DISPI_MAX_BPP
+        0, VBE_DISPI_MAX_XRES, VBE_DISPI_MAX_YRES, VBE_DISPI_MAX_BPP
       };
       MV_ASSERT(vbe_.index < sizeof(max_values) / sizeof(uint16_t));
       *data = max_values[vbe_.index];
@@ -453,17 +452,26 @@ void Vga::UpdateVRamMemoryMap() {
     if (debug_) {
       MV_LOG("VBE map offset=0x%lx, bank offset=0x%lx", offset, (vbe_.registers[VBE_DISPI_INDEX_BANK] << 16));
     }
+  
+    /* Map / unmap the area as ram to accelerate */
+    if (has_mapped_vga_) {
+      RemoveIoResource(kIoResourceTypeRam, VGA_MMIO_BASE);
+    }
+    AddIoResource(kIoResourceTypeRam, VGA_MMIO_BASE, VGA_MMIO_SIZE, "VGA RAM", vram_read_select_);
+    has_mapped_vga_ = true;
   } else if (mode_ == kDisplayVgaMode || mode_ == kDisplayTextMode) {
-    const int map_types[][2] = {
+    const size_t map_types[][2] = {
       { 0xA0000, 0x20000 }, { 0xA0000, 0x10000 },
       { 0xB0000, 0x08000 }, { 0xB8000, 0x08000 }
     };
-    /* Memory map select */
+    
+    /* Memory map select controls visual area while read select controls IO */
     int index = (vga_.gfx[6] >> 2) & 0b11;
     int read_index = vga_.gfx[4] & 0b11;
     vram_map_select_size_ = map_types[index][1];
     vram_map_select_ = vram_base_ + map_types[index][0] - VGA_MMIO_BASE;
     vram_read_select_ = vram_base_ + vram_map_select_size_ * read_index;
+
     if (debug_) {
       MV_LOG("VGA map index=%d read_index=%d", index, read_index);
     }
@@ -471,6 +479,9 @@ void Vga::UpdateVRamMemoryMap() {
 }
 
 void Vga::UpdateDisplayMode() {
+  auto old_mode = mode_;
+  auto old_w = width_, old_h = height_, old_bpp = bpp_;
+
   if (vbe_.registers[VBE_DISPI_INDEX_ENABLE] & VBE_DISPI_ENABLED) {
     mode_ = kDisplayVbeMode;
     width_ = vbe_.registers[VBE_DISPI_INDEX_XRES];
@@ -488,7 +499,10 @@ void Vga::UpdateDisplayMode() {
     height_ = 480;
     bpp_ = 8;
   }
-  NotifyDisplayModeChange();
+
+  if (old_mode != mode_ || old_w != width_ || old_h != height_ || old_bpp != bpp_) {
+    NotifyDisplayModeChange();
+  }
 }
 
 void Vga::NotifyDisplayModeChange() {

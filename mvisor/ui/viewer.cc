@@ -123,8 +123,7 @@ void Viewer::RenderPartial(const DisplayPartialBitmap* partial) {
   }
   int lines = partial->height;
   size_t src_index = 0;
-  while (lines > 0) {
-    MV_ASSERT(src_index < partial->vector.size());
+  while (lines > 0 && src_index < partial->vector.size()) {
     uint8_t* src = partial->vector[src_index].data;
     auto copy_lines = partial->vector[src_index].size / partial->stride;
     while (copy_lines > 0) {
@@ -252,7 +251,6 @@ PointerInputInterface* Viewer::GetActivePointer() {
 
 void Viewer::LookupDevices() {
   keyboard_ = dynamic_cast<KeyboardInputInterface*>(machine_->LookupObjectByClass("Ps2"));
-  spice_agent_ = dynamic_cast<SpiceAgentInterface*>(machine_->LookupObjectByClass("SpiceAgent"));
   display_ = dynamic_cast<DisplayInterface*>(machine_->device_manager()->LookupDeviceByClass("Qxl"));
   if (display_ == nullptr) {
     display_ = dynamic_cast<DisplayInterface*>(machine_->device_manager()->LookupDeviceByClass("Vga"));
@@ -260,6 +258,9 @@ void Viewer::LookupDevices() {
   }
   for (auto o : machine_->LookupObjects([](auto o) { return dynamic_cast<PointerInputInterface*>(o); })) {
     pointers_.push_back(dynamic_cast<PointerInputInterface*>(o));
+  }
+  for (auto o : machine_->LookupObjects([](auto o) { return dynamic_cast<DisplayResizeInterface*>(o); })) {
+    resizers_.push_back(dynamic_cast<DisplayResizeInterface*>(o));
   }
   MV_ASSERT(keyboard_ && display_);
 
@@ -295,7 +296,15 @@ int Viewer::MainLoop() {
     /* Check viewer window resize */
     if (pending_resize_.triggered && frame_start_time - pending_resize_.time >= std::chrono::milliseconds(300)) {
       pending_resize_.triggered = false;
-      spice_agent_->Resize(pending_resize_.width, pending_resize_.height);
+      for (auto resizer : resizers_) {
+        if (machine_->guest_os() == "Linux" && std::string("SpiceAgent") == dynamic_cast<Object*>(resizer)->classname()) {
+          /* FIXME: spice agent resize is not working on Linux */
+          continue;
+        }
+        if (resizer->Resize(pending_resize_.width, pending_resize_.height)) {
+          break;
+        }
+      }
     }
 
     /* Keep display FPS */
@@ -307,10 +316,23 @@ int Viewer::MainLoop() {
   return 0;
 }
 
+void Viewer::SendPointerEvent() {
+  auto pointer = GetActivePointer();
+  if (pointer && window_) {
+    int x, y, w, h;
+    SDL_GetMouseState(&x, &y);
+    SDL_GetWindowSize(window_, &w, &h);
+    /* Check if window is scaled */
+    x = x * width_ / w;
+    y = y * height_ / h;
+    pointer_state_.x = x;
+    pointer_state_.y = y;
+    pointer->QueuePointerEvent(pointer_state_);
+  }
+}
+
 void Viewer::HandleEvent(const SDL_Event& event) {
   uint8_t transcoded[10] = { 0 };
-  /* if we dont check the pointer changes, it would have 1000 pointer events per second */
-  bool should_update_pointer = false;
 
   switch (event.type)
   {
@@ -324,24 +346,18 @@ void Viewer::HandleEvent(const SDL_Event& event) {
     } else if (event.key.keysym.sym == SDLK_F2) {
       machine_->Pause();
       machine_->Save("/tmp/save");
+      return;
     }
   case SDL_KEYUP:
     if (TranslateScancode(event.key.keysym.scancode, event.type == SDL_KEYDOWN, transcoded)) {
       keyboard_->QueueKeyboardEvent(transcoded);
     }
     break;
-  case SDL_MOUSEWHEEL: {
-    int x, y;
-    SDL_GetMouseState(&x, &y);
-    auto pointer = GetActivePointer();
-    if (pointer) {
-      pointer_state_.x = x;
-      pointer_state_.y = y;
-      pointer_state_.z = event.wheel.y;
-      pointer->QueuePointerEvent(pointer_state_);
-    }
+  case SDL_MOUSEWHEEL:
+    pointer_state_.z = event.wheel.y;
+    SendPointerEvent();
+    pointer_state_.z = 0;
     break;
-  }
   case SDL_MOUSEBUTTONDOWN:
   case SDL_MOUSEBUTTONUP:
     if (event.button.state) {
@@ -349,32 +365,22 @@ void Viewer::HandleEvent(const SDL_Event& event) {
     } else {
       pointer_state_.buttons &= ~(1 << event.button.button);
     }
-    should_update_pointer = true;
-    /* fall through */
-  case SDL_MOUSEMOTION: {
-    auto pointer = GetActivePointer();
-    if (pointer) {
-      int x, y;
-      SDL_GetMouseState(&x, &y);
-      if (should_update_pointer || pointer_state_.x != x || pointer_state_.y != y) {
-        pointer_state_.x = x;
-        pointer_state_.y = y;
-        pointer_state_.z = 0;
-        pointer->QueuePointerEvent(pointer_state_);
-      }
+    SendPointerEvent();
+    break;
+  case SDL_MOUSEMOTION:
+    /* if we dont check the pointer changes, it would have 1000 pointer events per second */
+    if (event.motion.x != pointer_state_.x || event.motion.y != pointer_state_.y) {
+      SendPointerEvent();
     }
     break;
-  }
   case SDL_WINDOWEVENT:
     switch (event.window.event)
     {
     case SDL_WINDOWEVENT_RESIZED:
-      if (spice_agent_) {
-        pending_resize_.triggered = true;
-        pending_resize_.width = event.window.data1;
-        pending_resize_.height = event.window.data2;
-        pending_resize_.time = std::chrono::steady_clock::now();
-      }
+      pending_resize_.triggered = true;
+      pending_resize_.width = event.window.data1;
+      pending_resize_.height = event.window.data2;
+      pending_resize_.time = std::chrono::steady_clock::now();
       break;
     }
     break;
