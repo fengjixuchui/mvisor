@@ -4,23 +4,33 @@ base: q35.yaml
 machine:
   memory: 8G
   vcpu: 4
-  debug: No
-  hypervisor: No
+  # Turn on BIOS output and performance measurement
+  debug: Yes
+  # Turn on hypervisor to lower CPU usage (Hyper-V is used for Windows)
+  hypervisor: Yes
 
 objects:
+  - class: qxl
+  - class: spice-agent
+  - class: usb-tablet
+
+  - class: virtio-network
+    backend: uip
+    mac: 00:50:00:11:22:33
+
   - class: ahci-cdrom
     image: /mnt/iso/ubuntu-20.04.1-desktop-amd64.iso
   
-  # - class: ahci-disk
-  #   image: /data/empty.qcow2
-  #   snapshot: No
+  - class: ahci-cdrom
+    image: /mnt/iso/virtio.iso
 
   - class: virtio-block
     image: /data/win10.qcow2
     snapshot: Yes
 
-  # - name: nvidia-vgpu
-  #   class: vfio-pci
-  #   parent: pci-host
-  #   debug: Yes
+  - class: virtio-block
+    image: /data/ubuntu.qcow2
+    snapshot: Yes
+
+  # - class: vfio-pci
   #   sysfs: /sys/bus/mdev/devices/c2e088ba-954f-11ec-8584-525400666f2b

@@ -1,6 +1,6 @@
 /* 
  * MVisor QXL
- * Currently only the latest windows 8/10 guest DOD driver is tested
+ * Support latest Linux & Windows QXLDoD
  * 
  * Copyright (C) 2021 Terrence <terrence@tenclass.com>
  * 
@@ -23,6 +23,7 @@
 #include <vector>
 #include <map>
 #include <mutex>
+#include <algorithm>
 
 #include <zlib.h>
 
@@ -36,27 +37,37 @@
 #define NUM_MEMSLOTS 8
 #define MEMSLOT_GENERATION_BITS 8
 #define MEMSLOT_SLOT_BITS 8
-
-struct Surface {
-  uint            id;
-  QXLReleaseInfo* release_info;
-};
   
 struct PrimarySurface {
-  QXLSurfaceCreate  surface;
+  QXLSurfaceCreate  create;
   uint32_t          resized;
   int32_t           qxl_stride;
   uint32_t          abs_stride;
   uint32_t          bits_pp;
   uint32_t          bytes_pp;
+  bool              active;
+};
+
+struct Surface {
+  uint            id;
+  uint64_t        slot_address;
+  QXLSurfaceCmd*  qxl_surface_cmd;
+};
+
+struct Drawable
+{
+  uint64_t        slot_address;
+  QXLDrawable*    qxl_drawable;
+  bool            drawed;
+  bool            drawing;
 };
 
 class Qxl : public Vga, public DisplayResizeInterface {
  private:
   uint32_t  qxl_rom_size_;
-  void*     qxl_rom_base_;
+  void*     qxl_rom_base_ = nullptr;
   uint32_t  qxl_vram32_size_;
-  uint8_t*  qxl_vram32_base_;
+  uint8_t*  qxl_vram32_base_ = nullptr;
 
   QXLRom*   qxl_rom_;
   QXLModes* qxl_modes_;
@@ -69,22 +80,24 @@ class Qxl : public Vga, public DisplayResizeInterface {
     uint8_t*      hva; 
   } guest_slots_[NUM_MEMSLOTS];
 
-  PrimarySurface*           primary_surface_ = nullptr;
-  std::map<uint, Surface*>  surfaces_;
-  std::recursive_mutex      mutex_;
-  std::vector<QXLReleaseInfo*> free_resources_;
+  PrimarySurface                primary_surface_;
+  std::map<uint, Surface>       surfaces_;
+  std::vector<QXLReleaseInfo*>  free_resources_;
+  DisplayMouseCursor            current_cursor_;
+  std::list<Drawable>           drawables_;
 
  public:
   Qxl() {
+    default_rom_path_ = "../share/vgabios-qxl.bin";
+
     pci_header_.vendor_id = 0x1B36;
     pci_header_.device_id = 0x0100;
     pci_header_.revision_id = 5;
     pci_header_.irq_pin = 1;
     
-    /* Bar 1: 64MB, not used in Windows driver, but Linux driver 
-     * https://www.spice-space.org/multiple-monitors.html
-     */
-    qxl_vram32_size_ = _MB(128);
+    /* Bar 1: Windows driver uses this block of memory as a normal memslot
+     * Linux driver named it surface RAM */
+    qxl_vram32_size_ = _MB(8);
     qxl_vram32_base_ = (uint8_t*)valloc(qxl_vram32_size_);
     pci_bars_[1].host_memory = qxl_vram32_base_;
 
@@ -105,6 +118,7 @@ class Qxl : public Vga, public DisplayResizeInterface {
   }
 
   virtual void Reset() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     /* Vga Reset() resets mode */
     Vga::Reset();
 
@@ -112,19 +126,17 @@ class Qxl : public Vga, public DisplayResizeInterface {
     IntializeQxlRam();
 
     bzero(guest_slots_, sizeof(guest_slots_));
-    // Reset cursor
-    // Reset surfaces
-    if (primary_surface_) {
-      DestroyPrimarySurface();
-    }
-    for (auto it = surfaces_.begin(); it != surfaces_.end(); it++) {
-      delete it->second;
-    }
+    primary_surface_.active = false;
+    current_cursor_.visible = false;
     surfaces_.clear();
     free_resources_.clear();
+    drawables_.clear();
   }
 
   virtual bool SaveState(MigrationWriter* writer) {
+    /* Add all free_sources to release ring */
+    FreeGuestResources();
+  
     QxlState state;
     for (int i = 0; i < NUM_MEMSLOTS; i++) {
       auto slot = state.add_guest_slots();
@@ -133,22 +145,33 @@ class Qxl : public Vga, public DisplayResizeInterface {
       slot->set_active(guest_slots_[i].active);
     }
   
-    if (primary_surface_) {
+    if (primary_surface_.active) {
       auto primary = state.mutable_guest_primary();
-      auto& surface = primary_surface_->surface;
-      primary->set_width(surface.width);
-      primary->set_height(surface.height);
-      primary->set_stride(surface.stride);
-      primary->set_format(surface.format);
-      primary->set_position(surface.position);
-      primary->set_mouse_mode(surface.mouse_mode);
-      primary->set_flags(surface.flags);
-      primary->set_type(surface.type);
-      primary->set_mem_address(surface.mem);
+      auto& surface_create = primary_surface_.create;
+      primary->set_width(surface_create.width);
+      primary->set_height(surface_create.height);
+      primary->set_stride(surface_create.stride);
+      primary->set_format(surface_create.format);
+      primary->set_position(surface_create.position);
+      primary->set_mouse_mode(surface_create.mouse_mode);
+      primary->set_flags(surface_create.flags);
+      primary->set_type(surface_create.type);
+      primary->set_mem_address(surface_create.mem);
     }
-    for (auto info : free_resources_) {
-      state.add_free_resources((uint64_t)info - (uint64_t)qxl_vram32_base_);
+  
+    /* surfaces are not used now, but save it any way */
+    for (auto it = surfaces_.begin(); it != surfaces_.end(); it++) {
+      auto& surface = it->second;
+      auto sf = state.add_surfaces();
+      sf->set_id(surface.id);
+      sf->set_slot_address(surface.slot_address);
     }
+
+    for (auto& drawable: drawables_) {
+      auto dr = state.add_drawbles();
+      dr->set_slot_address(drawable.slot_address);
+    }
+
     writer->WriteProtobuf("QXL", state);
     writer->WriteRaw("VRAM32", qxl_vram32_base_, qxl_vram32_size_);
     return Vga::SaveState(writer);
@@ -177,8 +200,8 @@ class Qxl : public Vga, public DisplayResizeInterface {
       }
     }
 
-    auto& primary = state.guest_primary();
-    if (primary.width() && primary.height()) {
+    if (state.has_guest_primary()) {
+      auto& primary = state.guest_primary();
       QXLSurfaceCreate create = {
         .width = primary.width(),
         .height = primary.height(),
@@ -193,8 +216,21 @@ class Qxl : public Vga, public DisplayResizeInterface {
       CreatePrimarySurface(create);
     }
 
-    for (int i = 0; i < state.free_resources_size(); i++) {
-      free_resources_.push_back((QXLReleaseInfo*)(state.free_resources(i) + (uint64_t)qxl_vram32_base_));
+    for (int i = 0; i < state.surfaces_size(); i++) {
+      auto& sf = state.surfaces(i);
+      surfaces_[sf.id()] = Surface {
+        .id = sf.id(),
+        .slot_address = sf.slot_address(),
+        .qxl_surface_cmd = (QXLSurfaceCmd*)GetMemSlotAddress(sf.slot_address())
+      };
+    }
+
+    for (int i = 0; i < state.drawbles_size(); i++) {
+      auto& dr = state.drawbles(i);
+      drawables_.push_back(Drawable {
+        .slot_address = dr.slot_address(),
+        .qxl_drawable = (QXLDrawable*)GetMemSlotAddress(dr.slot_address())
+      });
     }
     return true;
   }
@@ -254,36 +290,46 @@ class Qxl : public Vga, public DisplayResizeInterface {
     SPICE_RING_INIT(&qxl_ram_->release_ring);
   }
 
-  virtual void OnRefreshTimer() {
-    if (mode_ == kDisplayQxlMode) {
-      if (primary_surface_) {
-        FetchGraphicsCommands();
-        FetchCursorCommands();
-      }
-    } else {
-      Vga::OnRefreshTimer();
+  /* Setup ioeventfd for notify commands, reduce IO operations */
+  virtual bool ActivatePciBar(uint8_t index) {
+    if (index == 3) {
+      manager_->RegisterIoEvent(this, kIoResourceTypePio, pci_bars_[index].address + QXL_IO_NOTIFY_CMD);
+      manager_->RegisterIoEvent(this, kIoResourceTypePio, pci_bars_[index].address + QXL_IO_NOTIFY_CURSOR);
     }
+    return Vga::ActivatePciBar(index);
+  }
+
+  virtual bool DeactivatePciBar(uint8_t index) {
+    if (index == 3) {
+      manager_->UnregisterIoEvent(this, kIoResourceTypePio, pci_bars_[index].address + QXL_IO_NOTIFY_CMD);
+      manager_->UnregisterIoEvent(this, kIoResourceTypePio, pci_bars_[index].address + QXL_IO_NOTIFY_CURSOR);
+    }
+    return Vga::DeactivatePciBar(index);
   }
 
   virtual void UpdateDisplayMode() {
-    if (primary_surface_ && primary_surface_->resized) {
+    /* Prevent from calling AcquireUpdate() when setting mode */
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (primary_surface_.active) {
       mode_ = kDisplayQxlMode;
-      width_ = primary_surface_->surface.width;
-      height_ = primary_surface_->surface.height;
-      bpp_ = primary_surface_->bits_pp;
+      width_ = primary_surface_.create.width;
+      height_ = primary_surface_.create.height;
+      bpp_ = primary_surface_.bits_pp;
+      stride_ = primary_surface_.abs_stride;
       NotifyDisplayModeChange();
     } else {
       Vga::UpdateDisplayMode();
     }
   }
 
-  virtual void GetDisplayMode(uint16_t* w, uint16_t* h, uint16_t* bpp) {
+  virtual void GetDisplayMode(uint* w, uint* h, uint* bpp, uint* stride) {
     if (mode_ == kDisplayQxlMode) {
-      *w = primary_surface_->surface.width;
-      *h = primary_surface_->surface.height;
-      *bpp = primary_surface_->bits_pp;
+      *w = primary_surface_.create.width;
+      *h = primary_surface_.create.height;
+      *bpp = primary_surface_.bits_pp;
+      *stride = primary_surface_.abs_stride;
     } else {
-      Vga::GetDisplayMode(w, h, bpp);
+      Vga::GetDisplayMode(w, h, bpp, stride);
     }
   }
 
@@ -301,6 +347,10 @@ class Qxl : public Vga, public DisplayResizeInterface {
 
   /* Display resize interface */
   virtual bool Resize(uint width, uint height) {
+    if (mode_ != kDisplayQxlMode) {
+      return false;
+    }
+  
     if (!(qxl_ram_->int_mask & QXL_INTERRUPT_CLIENT_MONITORS_CONFIG)) {
       return false;
     }
@@ -362,17 +412,19 @@ class Qxl : public Vga, public DisplayResizeInterface {
       switch (command)
       {
       case QXL_IO_NOTIFY_CMD:
-        manager_->io()->Schedule([this]() {
-          FetchGraphicsCommands();
-        });
-        break;
       case QXL_IO_NOTIFY_CURSOR:
-        manager_->io()->Schedule([this]() {
-          FetchCursorCommands();
-        });
+        FetchCommands();
         break;
       case QXL_IO_UPDATE_AREA:
-        // MV_LOG("QXL_IO_UPDATE_AREA not implemented");
+        if (debug_) {
+          MV_LOG("QXL_IO_UPDATE_AREA not implemented");
+        }
+        break;
+      case QXL_IO_UPDATE_IRQ:
+        UpdateIrqLevel();
+        break;
+      case QXL_IO_NOTIFY_OOM:
+        FlushCommandsAndResources(false);
         break;
       case QXL_IO_RESET:
         Reset();
@@ -387,18 +439,8 @@ class Qxl : public Vga, public DisplayResizeInterface {
         CreatePrimarySurface(qxl_ram_->create_surface);
         break;
       case QXL_IO_DESTROY_PRIMARY:
-        FetchGraphicsCommands();
-        FetchCursorCommands();
+        FlushCommandsAndResources(true);
         DestroyPrimarySurface();
-        break;
-      case QXL_IO_NOTIFY_OOM:
-        // MV_LOG("QXL guest OOM");
-        FetchGraphicsCommands();
-        FetchCursorCommands();
-        FreeGuestResources();
-        break;
-      case QXL_IO_UPDATE_IRQ:
-        UpdateIrqLevel();
         break;
       case QXL_IO_MONITORS_CONFIG_ASYNC:
         break;
@@ -406,11 +448,41 @@ class Qxl : public Vga, public DisplayResizeInterface {
         MV_PANIC("unhandled QXL command=0x%lx", command);
         break;
       }
+
       if (async) {
-        SetInterrupt(QXL_INTERRUPT_IO_CMD);
+        /* Do it like a real async command */
+        manager_->io()->Schedule([this]() {
+          SetInterrupt(QXL_INTERRUPT_IO_CMD);
+        });
       }
     } else {
       Vga::Write(resource, offset, data, size);
+    }
+  }
+
+  void FlushCommandsAndResources(bool destroy_primary = false) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+    /* Fetch any commands on ring */
+    FetchCommands();
+
+    /* Remove all drawed objects */
+    uint released = 0;
+    for (auto it = drawables_.begin(); it != drawables_.end();) {
+      if (it->drawed || (destroy_primary && !it->drawing)) {
+        ReleaseGuestResource(&it->qxl_drawable->release_info);
+        it = drawables_.erase(it);
+        ++released;
+      } else {
+        ++it;
+      }
+    }
+
+    /* Free released resources */
+    FreeGuestResources();
+
+    if (debug_) {
+      MV_LOG("drawables released=%u current=%lu", released, drawables_.size());
     }
   }
 
@@ -441,18 +513,19 @@ class Qxl : public Vga, public DisplayResizeInterface {
   void CreatePrimarySurface(QXLSurfaceCreate& create) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
   
-    MV_ASSERT(primary_surface_ == nullptr);
-    primary_surface_= new PrimarySurface;
-    primary_surface_->surface = create;
-    primary_surface_->qxl_stride = create.stride;
-    primary_surface_->abs_stride = abs(create.stride);
-    primary_surface_->resized++;
+    MV_ASSERT(!primary_surface_.active);
+    primary_surface_.create = create;
+    primary_surface_.qxl_stride = create.stride;
+    primary_surface_.abs_stride = abs(create.stride);
+    primary_surface_.resized++;
+    primary_surface_.active = true;
+
     switch (create.format)
     {
     case SPICE_SURFACE_FMT_32_xRGB:
     case SPICE_SURFACE_FMT_32_ARGB:
-      primary_surface_->bytes_pp = 4;
-      primary_surface_->bits_pp = 32;
+      primary_surface_.bytes_pp = 4;
+      primary_surface_.bits_pp = 32;
       break;
     default:
       MV_PANIC("unsupported surface format=0x%x", create.format);
@@ -462,7 +535,7 @@ class Qxl : public Vga, public DisplayResizeInterface {
       MV_LOG("create primary %dx%d", create.width, create.height);
     }
     bool changed = (mode_ != kDisplayQxlMode) || (width_ != create.width) ||
-      (height_ != create.height) || (bpp_ != primary_surface_->bits_pp);
+      (height_ != create.height) || (bpp_ != primary_surface_.bits_pp);
     if (changed) {
       UpdateDisplayMode();
     }
@@ -472,8 +545,7 @@ class Qxl : public Vga, public DisplayResizeInterface {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
   
     /* Maybe we should notify the viewer??? */
-    delete primary_surface_;
-    primary_surface_ = nullptr;
+    primary_surface_.active = false;
     mode_ = kDisplayUnknownMode;
     if (debug_)
       MV_LOG("destroy primary");
@@ -492,40 +564,32 @@ class Qxl : public Vga, public DisplayResizeInterface {
     return guest_slots_[slot_id].hva + (data & virtual_mask);
   }
 
-  void GetMemSlotChunkedData(uint64_t data, std::vector<DisplayPartialData>& vector) {
+  void GetMemSlotChunkedData(uint64_t data, std::vector<iovec>& vector) {
     while (data) {
       QXLDataChunk* chunk = (QXLDataChunk*)GetMemSlotAddress(data);
-      vector.emplace_back(DisplayPartialData {
-        .data = chunk->data,
-        .size = chunk->data_size
+      vector.emplace_back(iovec {
+        .iov_base = chunk->data,
+        .iov_len = chunk->data_size
       });
       data = chunk->next_chunk;
     }
   }
 
-  void GetMemSlotLinearizedData(QXLDataChunk* chunk, uint8_t** data, size_t* size) {
-    std::vector<QXLDataChunk*> chunks;
-    *size = 0;
+  void GetMemSlotChunkedData(QXLDataChunk* chunk, std::vector<iovec>& vector) {
     while (chunk) {
-      *size += chunk->data_size;
-      chunks.push_back(chunk);
+      vector.emplace_back(iovec {
+        .iov_base = chunk->data,
+        .iov_len = chunk->data_size
+      });
       if (chunk->next_chunk) {
         chunk = (QXLDataChunk*)GetMemSlotAddress(chunk->next_chunk);
       } else {
         chunk = nullptr;
       }
     }
-    MV_ASSERT(*size);
-    *data = new uint8_t[*size];
-    uint8_t* ptr = *data;
-    for (auto chunk : chunks) {
-      memcpy(ptr, chunk->data, chunk->data_size);
-      ptr += chunk->data_size;
-    }
   }
 
   void FreeGuestResources() {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (free_resources_.empty()) {
       return;
     }
@@ -556,89 +620,116 @@ class Qxl : public Vga, public DisplayResizeInterface {
   }
 
   void ReleaseGuestResource(QXLReleaseInfo* info) {
-    if (mode_ != kDisplayQxlMode) {
-      return;
-    }
-
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
     free_resources_.push_back(info);
+
     if (free_resources_.size() >= 32) {
       FreeGuestResources();
     }
   }
 
-  void FetchGraphicsCommands() {
+  /* Lock the drawables and translate to display partial bitmaps */
+  virtual bool AcquireUpdate(DisplayUpdate& update) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-  
+    if (mode_ != kDisplayQxlMode) {
+      return Vga::AcquireUpdate(update);
+    }
+    
+    FetchCommands();
+
+    for (auto& drawable : drawables_) {
+      if (drawable.drawed)
+        continue;
+      
+      drawable.drawing = true;
+      ParseDrawble(drawable, update.partials);
+    }
+    update.cursor = current_cursor_;
+    return true;
+  }
+
+  /* Update the drawing drawables to drawed */
+  virtual void ReleaseUpdate() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (mode_ != kDisplayQxlMode) {
+      return Vga::ReleaseUpdate();
+    }
+
+    for (auto& drawable : drawables_) {
+      if (drawable.drawing) {
+        drawable.drawing = false;
+        drawable.drawed = true;
+      }
+    }
+  }
+
+  void FetchCommands() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+    QXLCommand command;
+    while (FetchGraphicsCommand(command)) {
+      switch (command.type)
+      {
+      case QXL_CMD_SURFACE:
+        ParseSurfaceCommand(command.data);
+        break;
+      case QXL_CMD_DRAW:
+        ParseDrawCommand(command.data);
+        break;
+      default:
+        MV_PANIC("unhandled command type=0x%x data=0x%lx", command.type, command.data);
+        break;
+      }
+    }
+    while (FetchCursorCommand(command)) {
+      MV_ASSERT(command.type == QXL_CMD_CURSOR);
+      ParseCursorCommand(command.data);
+    }
+  }
+
+  bool FetchGraphicsCommand(QXLCommand& command) {
     QXLCommandRing* ring = &qxl_ram_->cmd_ring;
-    while (!SPICE_RING_IS_EMPTY(ring)) {
-      QXLCommand command = *SPICE_RING_CONS_ITEM(ring);
+    if (!SPICE_RING_IS_EMPTY(ring)) {
+      command = *SPICE_RING_CONS_ITEM(ring);
   
       bool should_notify;
       SPICE_RING_POP(ring, should_notify);
       if (should_notify) {
         SetInterrupt(QXL_INTERRUPT_DISPLAY);
       }
-      ParseCommand(command);
       bool should_wait;
       SPICE_RING_CONS_WAIT(ring, should_wait);
+      return true;
     }
+    return false;
   }
 
-  void FetchCursorCommands() {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-  
+  bool FetchCursorCommand(QXLCommand& command) {
     QXLCursorRing* ring = &qxl_ram_->cursor_ring;
-    while (!SPICE_RING_IS_EMPTY(ring)) {
-      QXLCommand command = *SPICE_RING_CONS_ITEM(ring);
+    if (!SPICE_RING_IS_EMPTY(ring)) {
+      command = *SPICE_RING_CONS_ITEM(ring);
       bool should_notify;
       SPICE_RING_POP(ring, should_notify);
       if (should_notify) {
         SetInterrupt(QXL_INTERRUPT_CURSOR);
       }
-      ParseCommand(command);
       bool should_wait;
       SPICE_RING_CONS_WAIT(ring, should_wait);
+      return true;
     }
+    return false;
   }
 
-  void ParseCommand(QXLCommand& command) {
-    if (mode_ != kDisplayQxlMode) {
-      return;
-    }
-    switch (command.type)
-    {
-    case QXL_CMD_DRAW: {
-      QXLDrawable* drawable = (QXLDrawable*)GetMemSlotAddress(command.data);
-      ParseDrawable(drawable);
-      break;
-    }
-    case QXL_CMD_CURSOR: {
-      QXLCursorCmd* cursor = (QXLCursorCmd*)GetMemSlotAddress(command.data);
-      ParseCursorCommand(cursor);
-      break;
-    }
-    case QXL_CMD_SURFACE: {
-      QXLSurfaceCmd* surface = (QXLSurfaceCmd*)GetMemSlotAddress(command.data);
-      ParseSurfaceCommand(surface);
-      break;
-    }
-    default:
-      DumpHex(&command, sizeof(command));
-      MV_PANIC("unhandled command type=0x%x data=0x%lx", command.type, command.data);
-      break;
-    }
-  }
-
-  void ParseSurfaceCommand(QXLSurfaceCmd* surface_cmd) {
+  void ParseSurfaceCommand(uint64_t slot_address) {
+    auto surface_cmd = (QXLSurfaceCmd*)GetMemSlotAddress(slot_address);
     switch (surface_cmd->type)
     {
     case QXL_SURFACE_CMD_CREATE: {
       auto& create = surface_cmd->u.surface_create;
-      auto surface = new Surface;
-      surface->id = surface_cmd->surface_id;
-      surface->release_info = &surface_cmd->release_info;
-      surfaces_[surface->id] = surface;
+      surfaces_[surface_cmd->surface_id] = Surface {
+        .id = surface_cmd->surface_id,
+        .slot_address = slot_address,
+        .qxl_surface_cmd = surface_cmd
+      };
       if (debug_)
         MV_LOG("create surface id=%d %dx%d format=%d", surface_cmd->surface_id, create.width, create.height, create.format);
       break;
@@ -649,14 +740,13 @@ class Qxl : public Vga, public DisplayResizeInterface {
         MV_LOG("surface %d not found", surface_cmd->surface_id);
         break;
       }
-      auto surface = it->second;
+      auto& surface = it->second;
       if (debug_)
-        MV_LOG("destroy surface id=%d", surface->id);
+        MV_LOG("destroy surface id=%d", surface.id);
 
-      ReleaseGuestResource(surface->release_info);
+      ReleaseGuestResource(&surface.qxl_surface_cmd->release_info);
       ReleaseGuestResource(&surface_cmd->release_info);
       surfaces_.erase(it);
-      delete surface;
       break;
     }
     default:
@@ -665,141 +755,177 @@ class Qxl : public Vga, public DisplayResizeInterface {
     }
   }
 
-  void ParseDrawable(QXLDrawable* drawable) {
-    DisplayPartialBitmap* partial = new DisplayPartialBitmap {
-      .width = drawable->bbox.right - drawable->bbox.left,
-      .height = drawable->bbox.bottom - drawable->bbox.top,
-      .x = drawable->bbox.left,
-      .y = drawable->bbox.top
-    };
-    MV_ASSERT(drawable->bbox.left >= 0 && drawable->bbox.top >= 0);
-    if (drawable->bbox.right > (int32_t)primary_surface_->surface.width ||
-      drawable->bbox.bottom > (int32_t)primary_surface_->surface.height) {
-      if (debug_) {
-        MV_LOG("Invalid draw box %d-%d %d-%d surface %ux%u",
-          drawable->bbox.left, drawable->bbox.right, drawable->bbox.top, drawable->bbox.bottom,
-          primary_surface_->surface.width, primary_surface_->surface.height);
-      }
-      ReleaseGuestResource(&drawable->release_info);
-      delete partial;
+  void PushNonOverlappingRects(std::vector<QXLRect>& rects, int left, int top, int right, int bottom) {
+    if (left >= right || top >= bottom) {
+      /* Invalid */
       return;
     }
-    MV_ASSERT(drawable->surface_id == 0);
+
+    // 扫描是否跟已有矩形有交集
+    for (size_t i = 0; i < rects.size(); i++) {
+      auto r = rects[i];
+      if (r.left < right && r.right > left && r.top < bottom && r.bottom > top) {
+        if (r.left > left)
+          PushNonOverlappingRects(rects, left, std::max(top, r.top), r.left, std::min(bottom, r.bottom));
+        if (r.right < right)
+          PushNonOverlappingRects(rects, r.right, std::max(top, r.top), right, std::min(bottom, r.bottom));
+        if (r.top > top)
+          PushNonOverlappingRects(rects, left, top, right, r.top);
+        if (r.bottom < bottom)
+          PushNonOverlappingRects(rects, left, r.bottom, right, bottom);
+        return;
+      }
+    }
   
-    switch (drawable->type)
+    // 无交集则增加新矩形
+    rects.emplace_back(QXLRect {
+      .top = top, .left = left, .bottom = bottom, .right = right
+    });
+  }
+
+  void RemoveInvisibleDrawables() {
+    std::vector<QXLRect> draw_rects;
+    size_t last_rects_count = 0;
+
+    /* Iterate the drawables from top to bottm, and add non-overlapping rectangle to draw_rects,
+     * If no rects are added, that drawable is discardable */
+    for (auto it = drawables_.rbegin(); it != drawables_.rend();) {
+      auto qxl_drawable = it->qxl_drawable;
+      auto& bbox = qxl_drawable->bbox;
+
+      PushNonOverlappingRects(draw_rects, bbox.left, bbox.top, bbox.right, bbox.bottom);
+      if (draw_rects.size() == last_rects_count && !it->drawing) {
+        ReleaseGuestResource(&qxl_drawable->release_info);
+        it = decltype(it)(drawables_.erase(std::next(it).base()));
+      } else {
+        last_rects_count = draw_rects.size();
+        ++it;
+      }
+    }
+  }
+
+  void ParseDrawCommand(uint64_t slot_address) {
+    auto qxl_drawable = (QXLDrawable*)GetMemSlotAddress(slot_address);
+    drawables_.push_back(Drawable {
+      .slot_address = slot_address,
+      .qxl_drawable = qxl_drawable
+    });
+    RemoveInvisibleDrawables();
+  }
+
+  void ParseCursorCommand(uint64_t slot_address) {
+    auto cursor_cmd = (QXLCursorCmd*)GetMemSlotAddress(slot_address);
+    switch (cursor_cmd->type)
+    {
+    case QXL_CURSOR_HIDE:
+      current_cursor_.visible = false;
+      ++current_cursor_.update_timestamp;
+      break;
+    case QXL_CURSOR_MOVE:
+      current_cursor_.x = cursor_cmd->u.position.x;
+      current_cursor_.y = cursor_cmd->u.position.y;
+      ++current_cursor_.update_timestamp;
+      break;
+    case QXL_CURSOR_SET: {
+      QXLCursor* cursor = (QXLCursor*)GetMemSlotAddress(cursor_cmd->u.set.shape);
+      current_cursor_.visible = cursor_cmd->u.set.visible;
+      current_cursor_.x = cursor_cmd->u.set.position.x;
+      current_cursor_.y = cursor_cmd->u.set.position.y;
+
+      auto& shape = current_cursor_.shape;
+      shape.type = cursor->header.type;
+      shape.width = cursor->header.width;
+      shape.height = cursor->header.height;
+      shape.hotspot_x = cursor->header.hot_spot_x;
+      shape.hotspot_y = cursor->header.hot_spot_y;
+      shape.vector.clear();
+      GetMemSlotChunkedData(&cursor->chunk, shape.vector);
+      MV_ASSERT(shape.vector.size() > 0);
+      ++shape.id;
+      ++current_cursor_.update_timestamp;
+      break;
+    }
+    default:
+      DumpHex(cursor_cmd, sizeof(*cursor_cmd));
+      MV_PANIC("unhandled cursor type=%d", cursor_cmd->type);
+      break;
+    }
+
+    ReleaseGuestResource(&cursor_cmd->release_info);
+  }
+
+  void ParseDrawble(Drawable& drawable, std::vector<DisplayPartialBitmap>& partials) {
+    auto qxl_drawable = drawable.qxl_drawable;
+    auto partial = DisplayPartialBitmap {
+      .width = uint(qxl_drawable->bbox.right - qxl_drawable->bbox.left),
+      .height = uint(qxl_drawable->bbox.bottom - qxl_drawable->bbox.top),
+      .x = uint(qxl_drawable->bbox.left),
+      .y = uint(qxl_drawable->bbox.top)
+    };
+    MV_ASSERT(qxl_drawable->bbox.left >= 0 && qxl_drawable->bbox.top >= 0);
+    if (qxl_drawable->bbox.right > (int32_t)primary_surface_.create.width ||
+      qxl_drawable->bbox.bottom > (int32_t)primary_surface_.create.height) {
+      if (debug_) {
+        MV_LOG("Invalid draw box %d-%d %d-%d surface %ux%u",
+          qxl_drawable->bbox.left, qxl_drawable->bbox.right, qxl_drawable->bbox.top, qxl_drawable->bbox.bottom,
+          primary_surface_.create.width, primary_surface_.create.height);
+      }
+      return;
+    }
+    MV_ASSERT(qxl_drawable->surface_id == 0);
+  
+    switch (qxl_drawable->type)
     {
     case QXL_DRAW_COPY: {
-      QXLCopy* copy = &drawable->u.copy;
-      MV_ASSERT(drawable->effect == QXL_EFFECT_OPAQUE);
-      if (drawable->self_bitmap) {
-        MV_ASSERT(drawable->self_bitmap_area.left == drawable->bbox.left && drawable->self_bitmap_area.right == drawable->bbox.right);
-      }
+      MV_ASSERT(qxl_drawable->effect == QXL_EFFECT_OPAQUE);
+      QXLCopy* copy = &qxl_drawable->u.copy;
       MV_ASSERT(copy->src_area.top == 0 && copy->src_area.left == 0);
       MV_ASSERT(copy->rop_descriptor == SPICE_ROPD_OP_PUT);
       QXLImage* image = (QXLImage*)GetMemSlotAddress(copy->src_bitmap);
       if (image->descriptor.type != SPICE_IMAGE_TYPE_BITMAP) {
         MV_PANIC("image->descriptor.type=0x%x", image->descriptor.type);
-        ReleaseGuestResource(&drawable->release_info);
-        delete partial;
         break;
       }
       if (image->descriptor.flags != 0) {
-        // MV_LOG("image->descriptor.flags=0x%x", image->descriptor.flags);
+        /* FIXME: CACHE_ME flag */
       }
 
       QXLBitmap* bitmap = &image->bitmap;
       MV_ASSERT(bitmap->format == SPICE_BITMAP_FMT_RGBA || bitmap->format == SPICE_BITMAP_FMT_32BIT);
       MV_ASSERT(bitmap->palette == 0);
-      MV_ASSERT(partial->width == (int)bitmap->x && partial->height == (int)bitmap->y);
-      partial->stride = bitmap->stride;
-      partial->flip = !(bitmap->flags & QXL_BITMAP_TOP_DOWN);
+      MV_ASSERT(partial.width == bitmap->x && partial.height == bitmap->y);
+      partial.stride = bitmap->stride;
+      partial.flip = !(bitmap->flags & QXL_BITMAP_TOP_DOWN);
 
-      if (drawable->clip.type == SPICE_CLIP_TYPE_RECTS) {
+      if (qxl_drawable->clip.type == SPICE_CLIP_TYPE_RECTS) {
         /* FIXME: handle clips */
       }
-      GetMemSlotChunkedData(bitmap->data, partial->vector);
-      partial->Release = [=]() {
-        ReleaseGuestResource(&drawable->release_info);
-        delete partial;
-      };
-      NotifyDisplayRender(partial);
+      GetMemSlotChunkedData(bitmap->data, partial.vector);
+      partials.emplace_back(std::move(partial));
       break;
     }
     case QXL_DRAW_FILL: {
-      QXLFill* fill = &drawable->u.fill;
+      QXLFill* fill = &qxl_drawable->u.fill;
       MV_ASSERT(fill->rop_descriptor == SPICE_ROPD_OP_PUT);
       QXLBrush* brush = &fill->brush;
       MV_ASSERT(brush->type == SPICE_BRUSH_TYPE_SOLID);
+      partial.stride = partial.width * primary_surface_.bytes_pp;
       uint32_t color = brush->u.color;
-      partial->stride = partial->width * primary_surface_->bytes_pp;
-      size_t size = partial->stride * partial->height;
-      uint8_t* data = new uint8_t[size];
-      memset(data, color, size);
-      partial->vector.emplace_back(DisplayPartialData {
-        .data = data,
-        .size = size
+      size_t size = partial.stride * partial.height;
+      vga_surface_.resize(size);
+      memset(vga_surface_.data(), color, size);
+      partial.vector.emplace_back(iovec {
+        .iov_base = vga_surface_.data(),
+        .iov_len = size
       });
-      partial->Release = [=]() {
-        ReleaseGuestResource(&drawable->release_info);
-        delete data;
-        delete partial;
-      };
-      NotifyDisplayRender(partial);
+      partials.emplace_back(std::move(partial));
       break;
     }
     default:
-      DumpHex(drawable, sizeof(*drawable));
-      MV_PANIC("unhandled drawable type=%d", drawable->type);
+      DumpHex(qxl_drawable, sizeof(*qxl_drawable));
+      MV_PANIC("unhandled drawable type=%d", qxl_drawable->type);
       break;
     }
-  }
-
-  void ParseCursorCommand(QXLCursorCmd* cursor) {
-    DisplayCursorUpdate* update = new DisplayCursorUpdate;
-    switch (cursor->type)
-    {
-    case QXL_CURSOR_HIDE:
-      update->command = kDisplayCursorUpdateHide;
-      update->Release = [=]() {
-        ReleaseGuestResource(&cursor->release_info);
-        delete update;
-      };
-      break;
-    case QXL_CURSOR_MOVE:
-      update->command = kDisplayCursorUpdateMove;
-      update->move.x = cursor->u.position.x;
-      update->move.y = cursor->u.position.y;
-      update->Release = [=]() {
-        ReleaseGuestResource(&cursor->release_info);
-        delete update;
-      };
-      break;
-    case QXL_CURSOR_SET: {
-      QXLCursor* shape = (QXLCursor*)GetMemSlotAddress(cursor->u.set.shape);
-      update->command = kDisplayCursorUpdateSet;
-      update->set.visible = cursor->u.set.visible;
-      update->set.x = cursor->u.set.position.x;
-      update->set.y = cursor->u.set.position.y;
-
-      update->set.type = shape->header.type;
-      update->set.width = shape->header.width;
-      update->set.height = shape->header.height;
-      update->set.hotspot_x = shape->header.hot_spot_x;
-      update->set.hotspot_y = shape->header.hot_spot_y;
-      GetMemSlotLinearizedData(&shape->chunk, &update->set.data, &update->set.size);
-      update->Release = [=]() {
-        ReleaseGuestResource(&cursor->release_info);
-        delete[] update->set.data;
-        delete update;
-      };
-      break;
-    }
-    default:
-      DumpHex(cursor, sizeof(*cursor));
-      MV_PANIC("unhandled cursor type=%d", cursor->type);
-      break;
-    }
-    NotifyDisplayCursorUpdate(update);
   }
 };
 

@@ -36,7 +36,7 @@ namespace protobuf_qxl_2eproto {
 struct TableStruct {
   static const ::google::protobuf::internal::ParseTableField entries[];
   static const ::google::protobuf::internal::AuxillaryParseTableField aux[];
-  static const ::google::protobuf::internal::ParseTable schema[3];
+  static const ::google::protobuf::internal::ParseTable schema[5];
   static const ::google::protobuf::internal::FieldMetadata field_metadata[];
   static const ::google::protobuf::internal::SerializationTable serialization_table[];
   static const ::google::protobuf::uint32 offsets[];
@@ -46,23 +46,35 @@ void InitDefaultsQxlState_GuestSlotImpl();
 void InitDefaultsQxlState_GuestSlot();
 void InitDefaultsQxlState_GuestPrimaryImpl();
 void InitDefaultsQxlState_GuestPrimary();
+void InitDefaultsQxlState_SurfaceImpl();
+void InitDefaultsQxlState_Surface();
+void InitDefaultsQxlState_DrawableImpl();
+void InitDefaultsQxlState_Drawable();
 void InitDefaultsQxlStateImpl();
 void InitDefaultsQxlState();
 inline void InitDefaults() {
   InitDefaultsQxlState_GuestSlot();
   InitDefaultsQxlState_GuestPrimary();
+  InitDefaultsQxlState_Surface();
+  InitDefaultsQxlState_Drawable();
   InitDefaultsQxlState();
 }
 }  // namespace protobuf_qxl_2eproto
 class QxlState;
 class QxlStateDefaultTypeInternal;
 extern QxlStateDefaultTypeInternal _QxlState_default_instance_;
+class QxlState_Drawable;
+class QxlState_DrawableDefaultTypeInternal;
+extern QxlState_DrawableDefaultTypeInternal _QxlState_Drawable_default_instance_;
 class QxlState_GuestPrimary;
 class QxlState_GuestPrimaryDefaultTypeInternal;
 extern QxlState_GuestPrimaryDefaultTypeInternal _QxlState_GuestPrimary_default_instance_;
 class QxlState_GuestSlot;
 class QxlState_GuestSlotDefaultTypeInternal;
 extern QxlState_GuestSlotDefaultTypeInternal _QxlState_GuestSlot_default_instance_;
+class QxlState_Surface;
+class QxlState_SurfaceDefaultTypeInternal;
+extern QxlState_SurfaceDefaultTypeInternal _QxlState_Surface_default_instance_;
 
 // ===================================================================
 
@@ -334,6 +346,211 @@ class QxlState_GuestPrimary : public ::google::protobuf::Message /* @@protoc_ins
 };
 // -------------------------------------------------------------------
 
+class QxlState_Surface : public ::google::protobuf::Message /* @@protoc_insertion_point(class_definition:QxlState.Surface) */ {
+ public:
+  QxlState_Surface();
+  virtual ~QxlState_Surface();
+
+  QxlState_Surface(const QxlState_Surface& from);
+
+  inline QxlState_Surface& operator=(const QxlState_Surface& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  #if LANG_CXX11
+  QxlState_Surface(QxlState_Surface&& from) noexcept
+    : QxlState_Surface() {
+    *this = ::std::move(from);
+  }
+
+  inline QxlState_Surface& operator=(QxlState_Surface&& from) noexcept {
+    if (GetArenaNoVirtual() == from.GetArenaNoVirtual()) {
+      if (this != &from) InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+  #endif
+  static const ::google::protobuf::Descriptor* descriptor();
+  static const QxlState_Surface& default_instance();
+
+  static void InitAsDefaultInstance();  // FOR INTERNAL USE ONLY
+  static inline const QxlState_Surface* internal_default_instance() {
+    return reinterpret_cast<const QxlState_Surface*>(
+               &_QxlState_Surface_default_instance_);
+  }
+  static PROTOBUF_CONSTEXPR int const kIndexInFileMessages =
+    2;
+
+  void Swap(QxlState_Surface* other);
+  friend void swap(QxlState_Surface& a, QxlState_Surface& b) {
+    a.Swap(&b);
+  }
+
+  // implements Message ----------------------------------------------
+
+  inline QxlState_Surface* New() const PROTOBUF_FINAL { return New(NULL); }
+
+  QxlState_Surface* New(::google::protobuf::Arena* arena) const PROTOBUF_FINAL;
+  void CopyFrom(const ::google::protobuf::Message& from) PROTOBUF_FINAL;
+  void MergeFrom(const ::google::protobuf::Message& from) PROTOBUF_FINAL;
+  void CopyFrom(const QxlState_Surface& from);
+  void MergeFrom(const QxlState_Surface& from);
+  void Clear() PROTOBUF_FINAL;
+  bool IsInitialized() const PROTOBUF_FINAL;
+
+  size_t ByteSizeLong() const PROTOBUF_FINAL;
+  bool MergePartialFromCodedStream(
+      ::google::protobuf::io::CodedInputStream* input) PROTOBUF_FINAL;
+  void SerializeWithCachedSizes(
+      ::google::protobuf::io::CodedOutputStream* output) const PROTOBUF_FINAL;
+  ::google::protobuf::uint8* InternalSerializeWithCachedSizesToArray(
+      bool deterministic, ::google::protobuf::uint8* target) const PROTOBUF_FINAL;
+  int GetCachedSize() const PROTOBUF_FINAL { return _cached_size_; }
+  private:
+  void SharedCtor();
+  void SharedDtor();
+  void SetCachedSize(int size) const PROTOBUF_FINAL;
+  void InternalSwap(QxlState_Surface* other);
+  private:
+  inline ::google::protobuf::Arena* GetArenaNoVirtual() const {
+    return NULL;
+  }
+  inline void* MaybeArenaPtr() const {
+    return NULL;
+  }
+  public:
+
+  ::google::protobuf::Metadata GetMetadata() const PROTOBUF_FINAL;
+
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+
+  // uint64 slot_address = 2;
+  void clear_slot_address();
+  static const int kSlotAddressFieldNumber = 2;
+  ::google::protobuf::uint64 slot_address() const;
+  void set_slot_address(::google::protobuf::uint64 value);
+
+  // uint32 id = 1;
+  void clear_id();
+  static const int kIdFieldNumber = 1;
+  ::google::protobuf::uint32 id() const;
+  void set_id(::google::protobuf::uint32 value);
+
+  // @@protoc_insertion_point(class_scope:QxlState.Surface)
+ private:
+
+  ::google::protobuf::internal::InternalMetadataWithArena _internal_metadata_;
+  ::google::protobuf::uint64 slot_address_;
+  ::google::protobuf::uint32 id_;
+  mutable int _cached_size_;
+  friend struct ::protobuf_qxl_2eproto::TableStruct;
+  friend void ::protobuf_qxl_2eproto::InitDefaultsQxlState_SurfaceImpl();
+};
+// -------------------------------------------------------------------
+
+class QxlState_Drawable : public ::google::protobuf::Message /* @@protoc_insertion_point(class_definition:QxlState.Drawable) */ {
+ public:
+  QxlState_Drawable();
+  virtual ~QxlState_Drawable();
+
+  QxlState_Drawable(const QxlState_Drawable& from);
+
+  inline QxlState_Drawable& operator=(const QxlState_Drawable& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  #if LANG_CXX11
+  QxlState_Drawable(QxlState_Drawable&& from) noexcept
+    : QxlState_Drawable() {
+    *this = ::std::move(from);
+  }
+
+  inline QxlState_Drawable& operator=(QxlState_Drawable&& from) noexcept {
+    if (GetArenaNoVirtual() == from.GetArenaNoVirtual()) {
+      if (this != &from) InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+  #endif
+  static const ::google::protobuf::Descriptor* descriptor();
+  static const QxlState_Drawable& default_instance();
+
+  static void InitAsDefaultInstance();  // FOR INTERNAL USE ONLY
+  static inline const QxlState_Drawable* internal_default_instance() {
+    return reinterpret_cast<const QxlState_Drawable*>(
+               &_QxlState_Drawable_default_instance_);
+  }
+  static PROTOBUF_CONSTEXPR int const kIndexInFileMessages =
+    3;
+
+  void Swap(QxlState_Drawable* other);
+  friend void swap(QxlState_Drawable& a, QxlState_Drawable& b) {
+    a.Swap(&b);
+  }
+
+  // implements Message ----------------------------------------------
+
+  inline QxlState_Drawable* New() const PROTOBUF_FINAL { return New(NULL); }
+
+  QxlState_Drawable* New(::google::protobuf::Arena* arena) const PROTOBUF_FINAL;
+  void CopyFrom(const ::google::protobuf::Message& from) PROTOBUF_FINAL;
+  void MergeFrom(const ::google::protobuf::Message& from) PROTOBUF_FINAL;
+  void CopyFrom(const QxlState_Drawable& from);
+  void MergeFrom(const QxlState_Drawable& from);
+  void Clear() PROTOBUF_FINAL;
+  bool IsInitialized() const PROTOBUF_FINAL;
+
+  size_t ByteSizeLong() const PROTOBUF_FINAL;
+  bool MergePartialFromCodedStream(
+      ::google::protobuf::io::CodedInputStream* input) PROTOBUF_FINAL;
+  void SerializeWithCachedSizes(
+      ::google::protobuf::io::CodedOutputStream* output) const PROTOBUF_FINAL;
+  ::google::protobuf::uint8* InternalSerializeWithCachedSizesToArray(
+      bool deterministic, ::google::protobuf::uint8* target) const PROTOBUF_FINAL;
+  int GetCachedSize() const PROTOBUF_FINAL { return _cached_size_; }
+  private:
+  void SharedCtor();
+  void SharedDtor();
+  void SetCachedSize(int size) const PROTOBUF_FINAL;
+  void InternalSwap(QxlState_Drawable* other);
+  private:
+  inline ::google::protobuf::Arena* GetArenaNoVirtual() const {
+    return NULL;
+  }
+  inline void* MaybeArenaPtr() const {
+    return NULL;
+  }
+  public:
+
+  ::google::protobuf::Metadata GetMetadata() const PROTOBUF_FINAL;
+
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+
+  // uint64 slot_address = 1;
+  void clear_slot_address();
+  static const int kSlotAddressFieldNumber = 1;
+  ::google::protobuf::uint64 slot_address() const;
+  void set_slot_address(::google::protobuf::uint64 value);
+
+  // @@protoc_insertion_point(class_scope:QxlState.Drawable)
+ private:
+
+  ::google::protobuf::internal::InternalMetadataWithArena _internal_metadata_;
+  ::google::protobuf::uint64 slot_address_;
+  mutable int _cached_size_;
+  friend struct ::protobuf_qxl_2eproto::TableStruct;
+  friend void ::protobuf_qxl_2eproto::InitDefaultsQxlState_DrawableImpl();
+};
+// -------------------------------------------------------------------
+
 class QxlState : public ::google::protobuf::Message /* @@protoc_insertion_point(class_definition:QxlState) */ {
  public:
   QxlState();
@@ -369,7 +586,7 @@ class QxlState : public ::google::protobuf::Message /* @@protoc_insertion_point(
                &_QxlState_default_instance_);
   }
   static PROTOBUF_CONSTEXPR int const kIndexInFileMessages =
-    2;
+    4;
 
   void Swap(QxlState* other);
   friend void swap(QxlState& a, QxlState& b) {
@@ -416,6 +633,8 @@ class QxlState : public ::google::protobuf::Message /* @@protoc_insertion_point(
 
   typedef QxlState_GuestSlot GuestSlot;
   typedef QxlState_GuestPrimary GuestPrimary;
+  typedef QxlState_Surface Surface;
+  typedef QxlState_Drawable Drawable;
 
   // accessors -------------------------------------------------------
 
@@ -443,6 +662,30 @@ class QxlState : public ::google::protobuf::Message /* @@protoc_insertion_point(
   ::google::protobuf::RepeatedField< ::google::protobuf::uint64 >*
       mutable_free_resources();
 
+  // repeated .QxlState.Surface surfaces = 6;
+  int surfaces_size() const;
+  void clear_surfaces();
+  static const int kSurfacesFieldNumber = 6;
+  const ::QxlState_Surface& surfaces(int index) const;
+  ::QxlState_Surface* mutable_surfaces(int index);
+  ::QxlState_Surface* add_surfaces();
+  ::google::protobuf::RepeatedPtrField< ::QxlState_Surface >*
+      mutable_surfaces();
+  const ::google::protobuf::RepeatedPtrField< ::QxlState_Surface >&
+      surfaces() const;
+
+  // repeated .QxlState.Drawable drawbles = 7;
+  int drawbles_size() const;
+  void clear_drawbles();
+  static const int kDrawblesFieldNumber = 7;
+  const ::QxlState_Drawable& drawbles(int index) const;
+  ::QxlState_Drawable* mutable_drawbles(int index);
+  ::QxlState_Drawable* add_drawbles();
+  ::google::protobuf::RepeatedPtrField< ::QxlState_Drawable >*
+      mutable_drawbles();
+  const ::google::protobuf::RepeatedPtrField< ::QxlState_Drawable >&
+      drawbles() const;
+
   // .QxlState.GuestPrimary guest_primary = 3;
   bool has_guest_primary() const;
   void clear_guest_primary();
@@ -459,6 +702,8 @@ class QxlState : public ::google::protobuf::Message /* @@protoc_insertion_point(
   ::google::protobuf::RepeatedPtrField< ::QxlState_GuestSlot > guest_slots_;
   ::google::protobuf::RepeatedField< ::google::protobuf::uint64 > free_resources_;
   mutable int _free_resources_cached_byte_size_;
+  ::google::protobuf::RepeatedPtrField< ::QxlState_Surface > surfaces_;
+  ::google::protobuf::RepeatedPtrField< ::QxlState_Drawable > drawbles_;
   ::QxlState_GuestPrimary* guest_primary_;
   mutable int _cached_size_;
   friend struct ::protobuf_qxl_2eproto::TableStruct;
@@ -649,6 +894,56 @@ inline void QxlState_GuestPrimary::set_mem_address(::google::protobuf::uint64 va
 
 // -------------------------------------------------------------------
 
+// QxlState_Surface
+
+// uint32 id = 1;
+inline void QxlState_Surface::clear_id() {
+  id_ = 0u;
+}
+inline ::google::protobuf::uint32 QxlState_Surface::id() const {
+  // @@protoc_insertion_point(field_get:QxlState.Surface.id)
+  return id_;
+}
+inline void QxlState_Surface::set_id(::google::protobuf::uint32 value) {
+  
+  id_ = value;
+  // @@protoc_insertion_point(field_set:QxlState.Surface.id)
+}
+
+// uint64 slot_address = 2;
+inline void QxlState_Surface::clear_slot_address() {
+  slot_address_ = GOOGLE_ULONGLONG(0);
+}
+inline ::google::protobuf::uint64 QxlState_Surface::slot_address() const {
+  // @@protoc_insertion_point(field_get:QxlState.Surface.slot_address)
+  return slot_address_;
+}
+inline void QxlState_Surface::set_slot_address(::google::protobuf::uint64 value) {
+  
+  slot_address_ = value;
+  // @@protoc_insertion_point(field_set:QxlState.Surface.slot_address)
+}
+
+// -------------------------------------------------------------------
+
+// QxlState_Drawable
+
+// uint64 slot_address = 1;
+inline void QxlState_Drawable::clear_slot_address() {
+  slot_address_ = GOOGLE_ULONGLONG(0);
+}
+inline ::google::protobuf::uint64 QxlState_Drawable::slot_address() const {
+  // @@protoc_insertion_point(field_get:QxlState.Drawable.slot_address)
+  return slot_address_;
+}
+inline void QxlState_Drawable::set_slot_address(::google::protobuf::uint64 value) {
+  
+  slot_address_ = value;
+  // @@protoc_insertion_point(field_set:QxlState.Drawable.slot_address)
+}
+
+// -------------------------------------------------------------------
+
 // QxlState
 
 // repeated .QxlState.GuestSlot guest_slots = 2;
@@ -761,9 +1056,73 @@ QxlState::mutable_free_resources() {
   return &free_resources_;
 }
 
+// repeated .QxlState.Surface surfaces = 6;
+inline int QxlState::surfaces_size() const {
+  return surfaces_.size();
+}
+inline void QxlState::clear_surfaces() {
+  surfaces_.Clear();
+}
+inline const ::QxlState_Surface& QxlState::surfaces(int index) const {
+  // @@protoc_insertion_point(field_get:QxlState.surfaces)
+  return surfaces_.Get(index);
+}
+inline ::QxlState_Surface* QxlState::mutable_surfaces(int index) {
+  // @@protoc_insertion_point(field_mutable:QxlState.surfaces)
+  return surfaces_.Mutable(index);
+}
+inline ::QxlState_Surface* QxlState::add_surfaces() {
+  // @@protoc_insertion_point(field_add:QxlState.surfaces)
+  return surfaces_.Add();
+}
+inline ::google::protobuf::RepeatedPtrField< ::QxlState_Surface >*
+QxlState::mutable_surfaces() {
+  // @@protoc_insertion_point(field_mutable_list:QxlState.surfaces)
+  return &surfaces_;
+}
+inline const ::google::protobuf::RepeatedPtrField< ::QxlState_Surface >&
+QxlState::surfaces() const {
+  // @@protoc_insertion_point(field_list:QxlState.surfaces)
+  return surfaces_;
+}
+
+// repeated .QxlState.Drawable drawbles = 7;
+inline int QxlState::drawbles_size() const {
+  return drawbles_.size();
+}
+inline void QxlState::clear_drawbles() {
+  drawbles_.Clear();
+}
+inline const ::QxlState_Drawable& QxlState::drawbles(int index) const {
+  // @@protoc_insertion_point(field_get:QxlState.drawbles)
+  return drawbles_.Get(index);
+}
+inline ::QxlState_Drawable* QxlState::mutable_drawbles(int index) {
+  // @@protoc_insertion_point(field_mutable:QxlState.drawbles)
+  return drawbles_.Mutable(index);
+}
+inline ::QxlState_Drawable* QxlState::add_drawbles() {
+  // @@protoc_insertion_point(field_add:QxlState.drawbles)
+  return drawbles_.Add();
+}
+inline ::google::protobuf::RepeatedPtrField< ::QxlState_Drawable >*
+QxlState::mutable_drawbles() {
+  // @@protoc_insertion_point(field_mutable_list:QxlState.drawbles)
+  return &drawbles_;
+}
+inline const ::google::protobuf::RepeatedPtrField< ::QxlState_Drawable >&
+QxlState::drawbles() const {
+  // @@protoc_insertion_point(field_list:QxlState.drawbles)
+  return drawbles_;
+}
+
 #ifdef __GNUC__
   #pragma GCC diagnostic pop
 #endif  // __GNUC__
+// -------------------------------------------------------------------
+
+// -------------------------------------------------------------------
+
 // -------------------------------------------------------------------
 
 // -------------------------------------------------------------------

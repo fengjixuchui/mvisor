@@ -73,8 +73,14 @@ VirtioPci::VirtioPci() {
 }
 
 void VirtioPci::Disconnect() {
-  /* Call reset to release io resources */
-  Reset();
+  if (use_ioevent_) {
+    for (uint index = 0; index < queues_.size(); index++) {
+      if (queues_[index].enabled) {
+        uint64_t notify_address = pci_bars_[4].address + 0x3000 + index * 4;
+        manager_->UnregisterIoEvent(this, kIoResourceTypeMmio, notify_address);
+      }
+    }
+  }
   PciDevice::Disconnect();
 }
 
@@ -261,7 +267,7 @@ void VirtioPci::NotifyQueue(VirtQueue& vq) {
   isr_status_ = 1;
   /* Make sure MSI X Enabled */
   if (vq.msix_vector == VIRTIO_MSI_NO_VECTOR) {
-    MV_PANIC("MSI X is not enabled");
+    return;
   }
   if (msi_config_.enabled) {
     SignalMsi(vq.msix_vector);
@@ -431,9 +437,6 @@ void VirtioPci::Write(const IoResource* resource, uint64_t offset, uint8_t* data
   } else {
     PciDevice::Write(resource, offset, data, size);
   }
-  if (debug_) {
-    MV_LOG("%s base=0x%lx offset=0x%lx size=%x data=0x%lx", name_, resource->base, offset, size, *(uint64_t*)data);
-  }
 }
 
 void VirtioPci::Read(const IoResource* resource, uint64_t offset, uint8_t* data, uint32_t size) {
@@ -450,9 +453,6 @@ void VirtioPci::Read(const IoResource* resource, uint64_t offset, uint8_t* data,
     }
   } else {
     PciDevice::Read(resource, offset, data, size);
-  }
-  if (debug_) {
-    MV_LOG("%s base=0x%lx offset=0x%lx size=%x data=0x%lx", name_, resource->base, offset, size, *(uint64_t*)data);
   }
 }
 

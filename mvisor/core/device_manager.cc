@@ -35,7 +35,9 @@
 /* SystemRoot is a motherboard that holds all the funcational devices */
 class SystemRoot : public Device {
  public:
-  SystemRoot() {}
+  SystemRoot() {
+    set_parent_name("");
+  }
  private:
   friend class DeviceManager;
 };
@@ -93,6 +95,7 @@ void DeviceManager::PrintDevices() {
         break;
       case kIoResourceTypeMmio:
         MV_LOG("\tMMIO address 0x%016lx-0x016%lx %d", resource->base, resource->base + resource->length - 1, resource->enabled);
+        break;
       case kIoResourceTypeRam:
         MV_LOG("\tRAM  address 0x%016lx-0x016%lx %d", resource->base, resource->base + resource->length - 1, resource->enabled);
         break;
@@ -110,10 +113,10 @@ Device* DeviceManager::LookupDeviceByClass(const std::string class_name) {
   return nullptr;
 }
 
-PciDevice* DeviceManager::LookupPciDevice(uint16_t bus, uint8_t devfn) {
+PciDevice* DeviceManager::LookupPciDevice(uint16_t bus, uint8_t slot, uint8_t function) {
   for (auto device : registered_devices_) {
     PciDevice* pci_device = dynamic_cast<PciDevice*>(device);
-    if (pci_device && pci_device->bus_ == bus && pci_device->devfn_ == devfn) {
+    if (pci_device && pci_device->bus_ == bus && pci_device->slot_ == slot && pci_device->function_ == function) {
       return pci_device;
     }
   }
@@ -123,11 +126,36 @@ PciDevice* DeviceManager::LookupPciDevice(uint16_t bus, uint8_t devfn) {
 
 void DeviceManager::RegisterDevice(Device* device) {
   // Check devfn conflicts or reassign it
-  PciDevice* pci_device = dynamic_cast<PciDevice*>(device);
-  if (pci_device) {
-    if (LookupPciDevice(pci_device->bus(), pci_device->devfn())) {
-      MV_PANIC("PCI device function %x conflicts", pci_device->devfn());
+  PciDevice* pci = dynamic_cast<PciDevice*>(device);
+  if (pci) {
+    /* Auto generate pci address */
+    if (pci->slot_ == 0xFF) {
+      auto parent = dynamic_cast<const PciDevice*>(pci->parent());
+      /* Check if Multi-function */
+      if (parent && (parent->pci_header_.header_type & 0x80)) {
+        pci->slot_ = parent->slot_;
+        for (uint i = 0; i < 8; i++) {
+          if (!LookupPciDevice(pci->bus_, pci->slot_, i)) {
+            pci->function_ = i;
+            break;
+          }
+        }
+      } else {
+        for (uint i = 1; i < 0x1F; i++) {
+          if (!LookupPciDevice(pci->bus_, i, pci->function_)) {
+            pci->slot_ = i;
+            break;
+          }
+        }
+      }
+    }
+
+    if (LookupPciDevice(pci->bus_, pci->slot_, pci->function_)) {
+      MV_PANIC("PCI device %x.%x conflicts", pci->slot_, pci->function_);
       return;
+    }
+    if (machine_->debug_) {
+      MV_LOG("register PCI %s at %x:%x.%x", pci->name_, pci->bus_, pci->slot_, pci->function_);
     }
   }
 
@@ -215,6 +243,7 @@ void DeviceManager::UnregisterIoHandler(Device* device, const IoResource* resour
   } else if (resource->type == kIoResourceTypeMmio) {
     for (auto it = mmio_handlers_.begin(); it != mmio_handlers_.end(); it++) {
       if ((*it)->device == device && (*it)->resource->base == resource->base) {
+        machine_->memory_manager()->Unmap(&(*it)->memory_region);
         delete *it;
         mmio_handlers_.erase(it);
         break;
@@ -490,7 +519,7 @@ void DeviceManager::SignalMsi(uint64_t address, uint32_t data) {
     .data = data
   };
   auto ret = ioctl(machine_->vm_fd_, KVM_SIGNAL_MSI, &msi);
-  if (ret != 1) {
+  if (ret < 0) {
     MV_PANIC("KVM_SIGNAL_MSI ret=%d", ret);
   }
 }
@@ -520,9 +549,9 @@ void DeviceManager::SetupIrqChip() {
   }
 
   // Use Kvm in-kernel PITClock
-  struct kvm_pit_config pit_config = { 0 };
+  struct kvm_pit_config pit_config = { .flags = KVM_PIT_SPEAKER_DUMMY };
   if (ioctl(machine_->vm_fd_, KVM_CREATE_PIT2, &pit_config) < 0) {
-    MV_PANIC("failed to create pit");
+    MV_PANIC("failed to create pit2");
   }
 }
 
@@ -648,10 +677,10 @@ bool DeviceManager::SaveState(MigrationWriter* writer) {
   MV_ASSERT(ioctl(machine_->vm_fd_, KVM_GET_PIT2, &pit2) == 0);
   writer->WriteRaw("PIT2", &pit2, sizeof(pit2));
   
-  // writer->SetPrefix("kvm-clock");
-  // kvm_clock_data clock = { 0 };
-  // MV_ASSERT(ioctl(machine_->vm_fd_, KVM_GET_CLOCK, &clock) == 0);
-  // writer->WriteRaw("CLOCK", &clock, sizeof(clock));
+  writer->SetPrefix("kvm-clock");
+  kvm_clock_data clock = { 0 };
+  MV_ASSERT(ioctl(machine_->vm_fd_, KVM_GET_CLOCK, &clock) == 0);
+  writer->WriteRaw("CLOCK", &clock, sizeof(clock));
 
   /* Save states of devices */
   for (auto device : registered_devices_) {
@@ -688,11 +717,13 @@ bool DeviceManager::LoadState(MigrationReader* reader) {
     return false;
   MV_ASSERT(ioctl(machine_->vm_fd_, KVM_SET_PIT2, &pit2) == 0);
 
-  // reader->SetPrefix("kvm-clock");
-  // kvm_clock_data clock = { 0 };
-  // if (!reader->ReadRaw("CLOCK", &clock, sizeof(clock)))
-  //   return false;
-  // MV_ASSERT(ioctl(machine_->vm_fd_, KVM_SET_CLOCK, &clock) == 0);
+  reader->SetPrefix("kvm-clock");
+  kvm_clock_data clock;
+  if (!reader->ReadRaw("CLOCK", &clock, sizeof(clock)))
+    return false;
+  clock.flags = 0;
+  bzero(clock.pad, sizeof(clock.pad));
+  MV_ASSERT(ioctl(machine_->vm_fd_, KVM_SET_CLOCK, &clock) == 0);
 
   /* Reset device states */
   for (auto device : registered_devices_) {

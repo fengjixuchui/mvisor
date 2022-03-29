@@ -45,21 +45,21 @@
 
 
 Vga::Vga() {
-  devfn_ = PCI_MAKE_DEVFN(2, 0);
+  default_rom_path_ = "../share/vgabios-stdvga.bin";
   
   /* PCI config */
   pci_header_.vendor_id = 0x1234;
   pci_header_.device_id = 0x1111;
   pci_header_.class_code = 0x030000;
+  pci_header_.revision_id = 2;
   pci_header_.header_type = PCI_HEADER_TYPE_NORMAL;
   pci_header_.subsys_vendor_id = 0x1AF4;
   pci_header_.subsys_id = 0x1100;
-  pci_header_.command = PCI_COMMAND_IO | PCI_COMMAND_MEMORY;
   
 
-  /* Bar 0: 64MB VRAM */
+  /* Bar 0: 256MB VRAM */
   vga_mem_size_ = _MB(16);
-  vram_size_ = _MB(64);
+  vram_size_ = _MB(256);
 
   AddPciBar(0, vram_size_, kIoResourceTypeRam);    /* vgamem */
   /* FIXME: bar 2 should be implemented for stdvga if Qxl is not enabled??? */
@@ -157,9 +157,13 @@ bool Vga::LoadState(MigrationReader* reader) {
 
 void Vga::Connect() {
   /* Initialize rom data and rom bar size */
-  if (!pci_rom_.data && has_key("rom")) {
-    std::string path = std::get<std::string>(key_values_["rom"]);
-    LoadRomFile(path.c_str());
+  if (!pci_rom_.data) {
+    if (has_key("rom")) {
+      std::string path = std::get<std::string>(key_values_["rom"]);
+      LoadRomFile(path.c_str());
+    } else {
+      LoadRomFile(default_rom_path_.c_str());
+    }
   }
   if (!vram_base_) {
     if (has_key("vram_size")) {
@@ -172,8 +176,6 @@ void Vga::Connect() {
     pci_bars_[0].host_memory = vram_base_;
   }
 
-  refresh_timer_ = manager_->io()->AddTimer(1000 / 30, true, std::bind(&Vga::OnRefreshTimer, this));
-
   PciDevice::Connect();
 }
 
@@ -182,7 +184,7 @@ void Vga::Disconnect() {
     munmap((void*)vram_base_, vram_size_);
     vram_base_ = nullptr;
   }
-  manager_->io()->RemoveTimer(refresh_timer_);
+  mode_ = kDisplayUnknownMode;
   PciDevice::Disconnect();
 }
 
@@ -194,10 +196,11 @@ void Vga::GetCursorLocation(uint8_t* x, uint8_t* y, uint8_t* sel_start, uint8_t*
   *x = location % 80;
 }
 
-void Vga::GetDisplayMode(uint16_t* w, uint16_t* h, uint16_t* bpp) {
+void Vga::GetDisplayMode(uint* w, uint* h, uint* bpp, uint* stride) {
   *w = width_;
   *h = height_;
   *bpp = bpp_;
+  *stride = stride_;
 }
 
 const uint8_t* Vga::GetPallete() const {
@@ -276,12 +279,18 @@ void Vga::VbeWritePort(uint64_t port, uint16_t value) {
         MV_LOG("set vbe enable to %x %dx%d bpp=%d", value,
           vbe_.registers[1], vbe_.registers[2], vbe_.registers[3]);
       }
-      if (value & 1) {
-        UpdateDisplayMode();
+      UpdateDisplayMode();
+      UpdateVRamMemoryMap();
+      if (value & VBE_DISPI_ENABLED) {
+        if (!(value & VBE_DISPI_NOCLEARMEM)) {
+          bzero(vram_map_select_, vram_map_select_size_);
+        }
       }
       break;
+    default:
+      UpdateVRamMemoryMap();
+      break;
     }
-    UpdateVRamMemoryMap();
   }
 }
 
@@ -333,6 +342,8 @@ void Vga::VgaReadPort(uint64_t port, uint8_t* data, uint32_t size) {
   case 0x3CF:
     MV_ASSERT(size == 1);
     *data = vga_.gfx[vga_.gfx_index];
+    if (vga_.gfx_index == 5)
+      *data = 0x50;
     break;
   case 0x3D4:
     MV_ASSERT(size == 1);
@@ -341,6 +352,8 @@ void Vga::VgaReadPort(uint64_t port, uint8_t* data, uint32_t size) {
   case 0x3D5:
     MV_ASSERT(size == 1);
     *data = vga_.crtc[vga_.crtc_index];
+    if (vga_.crtc_index == 7)
+      *data = 0x5d;
     break;
   case 0x3DA:
     MV_ASSERT(size == 1);
@@ -441,13 +454,11 @@ void Vga::VgaWritePort(uint64_t port, uint8_t* data, uint32_t size) {
 
 void Vga::UpdateVRamMemoryMap() {
   if (mode_ == kDisplayVbeMode) {
-    auto bpp = vbe_.registers[VBE_DISPI_INDEX_BPP];
-    uint stride = vbe_.registers[VBE_DISPI_INDEX_VIRT_WIDTH] * bpp / 8;
-    uint offset = vbe_.registers[VBE_DISPI_INDEX_X_OFFSET] * bpp / 8;
-    offset += vbe_.registers[VBE_DISPI_INDEX_Y_OFFSET] * stride;
+    uint offset = vbe_.registers[VBE_DISPI_INDEX_X_OFFSET] * bpp_ / 8;
+    offset += vbe_.registers[VBE_DISPI_INDEX_Y_OFFSET] * stride_;
   
     vram_map_select_ = vram_base_ + offset;
-    vram_map_select_size_ = vram_size_;
+    vram_map_select_size_ = stride_ * height_;
     vram_read_select_ = vram_base_ + (vbe_.registers[VBE_DISPI_INDEX_BANK] << 16);
     if (debug_) {
       MV_LOG("VBE map offset=0x%lx, bank offset=0x%lx", offset, (vbe_.registers[VBE_DISPI_INDEX_BANK] << 16));
@@ -484,20 +495,58 @@ void Vga::UpdateDisplayMode() {
 
   if (vbe_.registers[VBE_DISPI_INDEX_ENABLE] & VBE_DISPI_ENABLED) {
     mode_ = kDisplayVbeMode;
-    width_ = vbe_.registers[VBE_DISPI_INDEX_XRES];
-    height_ = vbe_.registers[VBE_DISPI_INDEX_YRES];
-    bpp_ = vbe_.registers[VBE_DISPI_INDEX_BPP];
+
+    /* VBE fixups */
+    auto& r = vbe_.registers;
+    r[VBE_DISPI_INDEX_XRES] &= ~3;
+    if (r[VBE_DISPI_INDEX_XRES] == 0) {
+      r[VBE_DISPI_INDEX_XRES] = 4;
+    }
+    if (r[VBE_DISPI_INDEX_XRES] > VBE_DISPI_MAX_XRES) {
+      r[VBE_DISPI_INDEX_XRES] = VBE_DISPI_MAX_XRES;
+    }
+    r[VBE_DISPI_INDEX_VIRT_WIDTH] &= ~3;
+    if (r[VBE_DISPI_INDEX_VIRT_WIDTH] > VBE_DISPI_MAX_XRES) {
+      r[VBE_DISPI_INDEX_VIRT_WIDTH] = VBE_DISPI_MAX_XRES;
+    }
+    if (r[VBE_DISPI_INDEX_VIRT_WIDTH] < r[VBE_DISPI_INDEX_XRES]) {
+      r[VBE_DISPI_INDEX_VIRT_WIDTH] = r[VBE_DISPI_INDEX_XRES];
+    }
+
+    if (r[VBE_DISPI_INDEX_YRES] == 0) {
+      r[VBE_DISPI_INDEX_YRES] = 1;
+    }
+    if (r[VBE_DISPI_INDEX_YRES] > VBE_DISPI_MAX_YRES) {
+      r[VBE_DISPI_INDEX_YRES] = VBE_DISPI_MAX_YRES;
+    }
+
+    if (r[VBE_DISPI_INDEX_X_OFFSET] > VBE_DISPI_MAX_XRES) {
+      r[VBE_DISPI_INDEX_X_OFFSET] = VBE_DISPI_MAX_XRES;
+    }
+    if (r[VBE_DISPI_INDEX_Y_OFFSET] > VBE_DISPI_MAX_YRES) {
+      r[VBE_DISPI_INDEX_Y_OFFSET] = VBE_DISPI_MAX_YRES;
+    }
+
+    width_ = r[VBE_DISPI_INDEX_XRES];
+    height_ = r[VBE_DISPI_INDEX_YRES];
+    bpp_ = r[VBE_DISPI_INDEX_BPP];
+    stride_ = r[VBE_DISPI_INDEX_VIRT_WIDTH] * bpp_ / 8;
   } else if ((vga_.gfx[6] & 0x1) == 0) {
     mode_ = kDisplayTextMode;
     width_ = 640;
     height_ = 400;
     bpp_ = 8;
+    stride_ = width_ * bpp_ / 8;
   } else {
     /* FIXME: width/height/bpp should be calculate from VGA regs */
     mode_ = kDisplayVgaMode;
     width_ = 640;
     height_ = 480;
     bpp_ = 8;
+    stride_ = width_ * bpp_ / 8;
+  }
+  if (debug_) {
+    MV_LOG("update mode=%d %dx%dx%d", mode_, width_, height_, bpp_);
   }
 
   if (old_mode != mode_ || old_w != width_ || old_h != height_ || old_bpp != bpp_) {
@@ -515,82 +564,59 @@ void Vga::RegisterDisplayChangeListener(DisplayChangeListener callback) {
   display_change_listerners_.push_back(callback);
 }
 
-void Vga::RegisterDisplayRenderer(DisplayRenderCallback draw_callback,
-    DisplayCursorUpdateCallback cursor_callback) {
-  display_render_callbacks_.push_back(draw_callback);
-  display_cursor_callbacks_.push_back(cursor_callback);
-}
-
-void Vga::NotifyDisplayRender(DisplayPartialBitmap* partial) {
-  for (auto &renderer : display_render_callbacks_) {
-    renderer(partial);
+bool Vga::AcquireUpdate(DisplayUpdate& update) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  if (mode_ == kDisplayUnknownMode) {
+    return false;
   }
-}
 
-void Vga::NotifyDisplayCursorUpdate(DisplayCursorUpdate* update) {
-  for (auto &callback : display_cursor_callbacks_) {
-    callback(update);
-  }
-}
-
-void Vga::OnRefreshTimer() {
-  if (mode_ == kDisplayTextMode) {
-    RenderTextMode();
-  } else if (mode_ == kDisplayVbeMode) {
-    RenderGraphicsMode();
-  }
-}
-
-void Vga::RenderGraphicsMode() {
-  DisplayPartialBitmap* partial = new DisplayPartialBitmap {
+  auto partial = DisplayPartialBitmap {
+    .stride = stride_,
     .width = width_,
     .height = height_,
     .x = 0,
     .y = 0
   };
-  partial->stride = partial->width * (bpp_ >> 3);
-  partial->vector.emplace_back(DisplayPartialData {
-    .data = vram_map_select_,
-    .size = size_t(partial->stride * partial->height)
-  });
-  partial->Release = [partial]() {
-    delete partial;
-  };
-  NotifyDisplayRender(partial);
-}
 
-void Vga::RenderTextMode() {
-  DisplayPartialBitmap* partial = new DisplayPartialBitmap {
-    .width = width_,
-    .height = height_,
-    .x = 0,
-    .y = 0
-  };
-  partial->stride = partial->width * (bpp_ >> 3);
-  uint8_t* buffer = new uint8_t[partial->stride * partial->height];
-  partial->vector.emplace_back(DisplayPartialData {
-    .data = buffer,
-    .size = size_t(partial->stride * partial->height)
-  });
-  partial->Release = [partial]() {
-    delete[] partial->vector[0].data;
-    delete partial;
-  };
+  size_t data_size = stride_ * height_;
 
-  uint8_t* ptr = vram_map_select_;
-  for (int y = 0; y < 25; y++) {
-    for (int x = 0; x < 80; x++) {
-      int character = *ptr++;
-      int attribute = *ptr++;
-      DrawCharacter(buffer, partial->stride, x, y, character, attribute);
+  if (mode_ == kDisplayVbeMode) {
+    partial.vector.emplace_back(iovec {
+      .iov_base = vram_map_select_,
+      .iov_len = data_size
+    });
+  } else if (mode_ == kDisplayTextMode) {
+    if (vga_surface_.size() != data_size) {
+      vga_surface_.resize(data_size);
     }
+    uint8_t* ptr = vram_map_select_;
+    for (int y = 0; y < 25; y++) {
+      for (int x = 0; x < 80; x++) {
+        int character = *ptr++;
+        int attribute = *ptr++;
+        DrawCharacter((uint8_t*)vga_surface_.data(), stride_, x, y, character, attribute);
+      }
+    }
+    
+    DrawTextCursor((uint8_t*)vga_surface_.data(), stride_);
+    partial.vector.emplace_back(iovec {
+      .iov_base = vga_surface_.data(),
+      .iov_len = data_size
+    });
+  } else {
+    /* legacy VGA not supported yet */
+    mutex_.unlock();
+    return false;
   }
-  
-  DrawTextCursor(buffer, partial->stride);
-  NotifyDisplayRender(partial);
+  update.partials.emplace_back(std::move(partial));
+  update.cursor.visible = false;
+  return true;
 }
 
-void Vga::DrawCharacter(uint8_t* buffer, int stride, int x, int y, int character, int attribute) {
+void Vga::ReleaseUpdate() {
+}
+
+void Vga::DrawCharacter(uint8_t* buffer, uint stride, uint x, uint y, int character, int attribute) {
   uint8_t* font = (uint8_t*)__font8x16;
 
   buffer += (y * 16) * stride;
@@ -611,7 +637,7 @@ void Vga::DrawCharacter(uint8_t* buffer, int stride, int x, int y, int character
   }
 }
 
-void Vga::DrawTextCursor(uint8_t* buffer, int stride) {
+void Vga::DrawTextCursor(uint8_t* buffer, uint stride) {
   uint32_t fore_color = 7;
   uint8_t cx, cy, sl_start, sl_end;
   GetCursorLocation(&cx, &cy, &sl_start, &sl_end);

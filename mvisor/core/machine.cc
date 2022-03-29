@@ -61,7 +61,10 @@ Machine::Machine(std::string config_path) {
   /* Initialize device manager, connect and reset all devices */
   device_manager_ = new DeviceManager(this, root);
   /* Create vcpu objects */
-  CreateVcpu();
+  for (int i = 0; i < num_vcpus_; ++i) {
+    Vcpu* vcpu = new Vcpu(this, i);
+    vcpus_.push_back(vcpu);
+  }
 }
 
 /* Free VM resources */
@@ -77,7 +80,7 @@ Machine::~Machine() {
   delete memory_manager_;
   delete io_thread_;
 
-  // delete objects created by confiration
+  // delete objects created by configuration
   for (auto it = objects_.begin(); it != objects_.end(); it++) {
     delete it->second;
   }
@@ -132,13 +135,6 @@ void Machine::CreateArchRelated() {
   
   /* Map these addresses as reserved so the guest never touch it */
   memory_manager_->Map(X86_EPT_IDENTITY_BASE, 4 * PAGE_SIZE, nullptr, kMemoryTypeReserved, "EPT+TSS");
-}
-
-void Machine::CreateVcpu() {
-  for (int i = 0; i < num_vcpus_; ++i) {
-    Vcpu* vcpu = new Vcpu(this, i);
-    vcpus_.push_back(vcpu);
-  }
 }
 
 

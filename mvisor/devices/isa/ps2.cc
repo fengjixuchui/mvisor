@@ -352,15 +352,12 @@ class Ps2 : public Device, public KeyboardInputInterface {
   }
 
   void WriteCommandPort(uint8_t command) {
-    status_ &= ~STATUS_COMMAND;
-
     switch (command)
     {
     case 0x20: // read 
       PushKeyboard(mode_ | (status_ & STATUS_SYSFLAG));
       break;
     case 0x60: // control mode
-      status_ |= STATUS_COMMAND;
       last_command_ = command;
       break;
     case 0xA7: // disable mouse
@@ -394,7 +391,6 @@ class Ps2 : public Device, public KeyboardInputInterface {
       }
       break;
     case 0xD1 ... 0xD4: // outport utilities
-      status_ |= STATUS_COMMAND;
       last_command_ = command;
       break;
     case 0xFE ... 0xFF: // pulse output line
@@ -409,11 +405,10 @@ class Ps2 : public Device, public KeyboardInputInterface {
       MV_PANIC("unhandled command=0x%x", command);
       break;
     }
+    status_ |= STATUS_COMMAND;
   }
 
   void WriteDataPort(uint8_t data) {
-    status_ &= STATUS_COMMAND;
-
     uint8_t command = last_command_;
     last_command_ = 0;
     switch (command)
@@ -459,6 +454,8 @@ class Ps2 : public Device, public KeyboardInputInterface {
 
  public:
   Ps2() {
+    set_parent_name("ich9-lpc");
+
     AddIoResource(kIoResourceTypePio, 0x92, 1, "A20 Gate");
     AddIoResource(kIoResourceTypePio, 0x60, 1, "PS2 Data");
     AddIoResource(kIoResourceTypePio, 0x64, 1, "PS2 Command");

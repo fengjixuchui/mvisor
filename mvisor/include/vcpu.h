@@ -26,15 +26,11 @@
 #include <mutex>
 
 #include "migration.h"
+#include "states/vcpu.pb.h"
 
 #define SIG_USER_INTERRUPT (SIGRTMIN + 0)
 
 class Machine;
-
-struct VcpuRegisters {
-  struct kvm_regs regs;
-  struct kvm_sregs sregs;
-};
 
 typedef std::function<void(void)> VoidCallback;
 struct VcpuTask {
@@ -70,6 +66,7 @@ class Vcpu {
 
  private:
   static void SignalHandler(int signum);
+  void PrepareX86Vcpu();
   void SetupSingalHandler();
   void SetupCpuid();
   void SetupMachineCheckException();
@@ -79,7 +76,10 @@ class Vcpu {
   void Process();
   void ProcessIo();
   void ProcessMmio();
+  void ProcessHyperV();
   void ExecuteTasks();
+  void SaveStateTo(VcpuState& state);
+  void LoadStateFrom(VcpuState& state);
 
   static __thread Vcpu*     current_vcpu_;
 
@@ -87,13 +87,15 @@ class Vcpu {
   int                       vcpu_id_ = -1;
   int                       fd_ = -1;
   char                      name_[16];
-  kvm_run*                  kvm_run_;
-  kvm_coalesced_mmio_ring*  mmio_ring_;
+  kvm_run*                  kvm_run_ = nullptr;
+  kvm_coalesced_mmio_ring*  mmio_ring_ = nullptr;
   std::thread               thread_;
   bool                      single_step_ = false;
-  VcpuRegisters             default_registers_;
+  VcpuState                 default_state_;
   std::deque<VcpuTask>      tasks_;
   std::mutex                mutex_;
+  std::set<uint32_t>        msr_indices_;
+  uint32_t                  hyperv_features_;
 };
 
 #endif // _MVISOR_VCPU_H

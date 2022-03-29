@@ -36,7 +36,8 @@
 
 AhciHost::AhciHost() {
   /* FIXME: should gernerated by parent pci device */
-  devfn_ = PCI_MAKE_DEVFN(31, 2);
+  slot_ = 31;
+  function_ =  2;
   
   /* PCI config */
   pci_header_.vendor_id = 0x8086;
@@ -46,8 +47,6 @@ AhciHost::AhciHost() {
   pci_header_.header_type = PCI_MULTI_FUNCTION | PCI_HEADER_TYPE_NORMAL;
   pci_header_.subsys_vendor_id = 0x1AF4;
   pci_header_.subsys_id = 0x1100;
-  pci_header_.command = PCI_COMMAND_IO | PCI_COMMAND_MEMORY;
-  pci_header_.cacheline_size = 8;
   pci_header_.irq_pin = 1;
 
   pci_header_.data[0x90] = 1 << 6; /* Address Map Register - AHCI mode */
@@ -92,6 +91,7 @@ void AhciHost::Disconnect() {
       ports_[i] = nullptr;
     }
   }
+  PciDevice::Disconnect();
 }
 
 void AhciHost::Reset() {
@@ -152,7 +152,9 @@ void AhciHost::Write(const IoResource* resource, uint64_t offset, uint8_t* data,
   
   if (offset >= 0x100) {
     int port = (offset - 0x100) >> 7;
-    ports_[port]->Write(offset & 0x7f, value);
+    if (ports_[port]) {
+      ports_[port]->Write(offset & 0x7f, value);
+    }
   } else {
     switch (offset / 4)
     {

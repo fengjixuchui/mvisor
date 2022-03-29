@@ -25,6 +25,7 @@
 
 
 IdeStorageDevice::IdeStorageDevice() {
+  set_parent_name("ahci-host");
   image_ = nullptr;
   bzero(&drive_info_, sizeof(drive_info_));
   bzero(&regs_, sizeof(regs_));
@@ -61,11 +62,11 @@ IdeStorageDevice::IdeStorageDevice() {
 }
 
 void IdeStorageDevice::Disconnect() {
-  Device::Disconnect();
   if (image_) {
     delete image_;
     image_ = nullptr;
   }
+  Device::Disconnect();
 }
 
 void IdeStorageDevice::Connect() {

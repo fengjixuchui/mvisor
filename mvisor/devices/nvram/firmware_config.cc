@@ -27,6 +27,14 @@
 
 #define FW_CFG_ACPI_DEVICE_ID "QEMU0002"
 
+#define FEATURE_CONTROL_LOCKED                    (1<<0)
+#define FEATURE_CONTROL_VMXON_ENABLED_INSIDE_SMX  (1ULL << 1)
+#define FEATURE_CONTROL_VMXON_ENABLED_OUTSIDE_SMX (1<<2)
+#define FEATURE_CONTROL_SGX_LC                    (1ULL << 17)
+#define FEATURE_CONTROL_SGX                       (1ULL << 18)
+#define FEATURE_CONTROL_LMCE                      (1<<20)
+
+
 class FirmwareConfig : public Device {
  private:
   uint16_t current_index_ = 0;
@@ -123,13 +131,7 @@ class FirmwareConfig : public Device {
     SetConfigBytes(FW_CFG_NUMA, std::string((const char*)numa_cfg, sizeof(numa_cfg)));
     SetConfigUInt16(FW_CFG_NOGRAPHIC, 0);
     SetConfigUInt32(FW_CFG_IRQ0_OVERRIDE, 1);
-
-    auto cdrom = machine->LookupObjectByClass("AhciCdrom");
-    if (cdrom && cdrom->has_key("image")) {
-      SetConfigUInt16(FW_CFG_BOOT_MENU, 2); // show menu if more than 1 drives
-    } else {
-      SetConfigUInt16(FW_CFG_BOOT_MENU, 0);
-    }
+    SetConfigUInt16(FW_CFG_BOOT_MENU, 0);
 
     InitializeE820Table();
 
@@ -138,11 +140,15 @@ class FirmwareConfig : public Device {
   }
 
   void InitializeFiles () {
+    /* Set VMX ON and VM is outside of SMX */
+    uint64_t feature_control = FEATURE_CONTROL_VMXON_ENABLED_OUTSIDE_SMX | FEATURE_CONTROL_LOCKED;
+    AddConfigFile("etc/msr_feature_control", &feature_control, sizeof(feature_control));
+
     AddConfigFile("bios-geometry", nullptr, 0);
 
     std::string smbios_anchor, smbios_table;
     Smbios smbios(manager_->machine());
-    smbios.GetTables(smbios_anchor, smbios_table);
+    smbios.GetTables(smbios_anchor, smbios_table); 
     AddConfigFile("etc/smbios/smbios-tables", smbios_table.data(), smbios_table.size());
     AddConfigFile("etc/smbios/smbios-anchor", smbios_anchor.data(), smbios_anchor.size());
   }
@@ -193,9 +199,19 @@ class FirmwareConfig : public Device {
   }
 
   void Connect() {
-    InitializeConfig();
-
     Device::Connect();
+    InitializeConfig();
+  }
+
+  void Reset() {
+    Device::Reset();
+
+    /* show menu if more than 1 drives */
+    if (manager_->io()->GetDiskImageCount() > 1) {
+      SetConfigUInt16(FW_CFG_BOOT_MENU, 2);
+    } else {
+      SetConfigUInt16(FW_CFG_BOOT_MENU, 0);
+    }
   }
 
   bool SaveState(MigrationWriter* writer) {
